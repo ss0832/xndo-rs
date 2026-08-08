@@ -1,0 +1,12 @@
+# PROVENANCE: MolDS 0.3.1, src/base/atoms/{H,Li,C,N,O,S}atom.cpp
+# UPSTREAM: https://sources.debian.org/src/molds/0.3.1-3/src/base/atoms/
+# LICENSE: GPL-3.0-or-later (MolDS upstream); see third_party/molds/NOTICE
+# SCOPE: atomic parameters used by MolDS CNDO2 and INDO paths. The MolDS method label INDO is preserved as-is; this table MUST NOT be silently relabeled INDO/1 or INDO/2 without validating the convention.
+# UNITS: *_ev are eV; effective charges and INDO native constants/coefficients are stored exactly in the dimensionless/native convention of MolDS source.
+z,sym,core_charge,valence_electrons,valence_shell,has_s,has_p,has_d_cndo_indo,bonding_parameter_ev,imu_amu_s_ev,imu_amu_p_ev,imu_amu_d_ev,z_eff_k,z_eff_l,z_eff_msp,z_eff_md,indo_g1_native,indo_f2_native,indo_f0_coeff_s,indo_f0_coeff_p,indo_g1_coeff_s,indo_g1_coeff_p,indo_f2_coeff_s,indo_f2_coeff_p,source_file
+1,H,1.0,1,k,1,0,0,-9.0,7.176,0.0,0.0,1.2,0.0,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.0,0.0,Hatom.cpp
+3,Li,1.0,1,l,1,1,0,-9.0,3.106,1.258,0.0,2.7,1.3,0.0,0.0,0.092012,0.049865,0.5,0.5,0.0,-0.08333333333333333,0.0,0.0,Liatom.cpp
+6,C,4.0,4,l,1,1,0,-21.0,14.051,5.572,0.0,5.7,3.25,0.0,0.0,0.267708,0.17372,3.5,3.5,-0.4166666666666667,-0.3333333333333333,0.0,-0.12,Catom.cpp
+7,N,5.0,5,l,1,1,0,-25.0,19.316,7.275,0.0,6.7,3.90,0.0,0.0,0.346029,0.219055,4.5,4.5,-0.5833333333333334,-0.3333333333333333,0.0,-0.20,Natom.cpp
+8,O,6.0,6,l,1,1,0,-31.0,25.390,9.111,0.0,7.70,4.55,0.0,0.0,0.346029,0.219055,5.5,5.5,-0.75,-0.3333333333333333,0.0,-0.28,Oatom.cpp
+16,S,6.0,6,m,1,1,1,-18.150,17.650,6.989,0.713,15.70,11.85,5.45,5.45,0.267708,0.17372,0.0,0.0,0.0,0.0,0.0,0.0,Satom.cpp

@@ -1,0 +1,30 @@
+MolDS 0.3.1 parameter-data provenance
+=====================================
+
+xndo-rs 0.2.3 retains transcribed, machine-readable parameter subsets from
+MolDS 0.3.1 for its CNDO2/INDO and ZINDO/S paths (H, Li, C, N, O, S). The native
+CNDO/2 and ground-state INDO engines also independently port the corresponding
+MolDS numerical conventions/equations into Rust under the compatible
+GPL-3.0-or-later project licence.
+
+Upstream: https://sources.debian.org/src/molds/0.3.1-3/
+Original project: https://osdn.net/projects/molds/
+Copyright: 2011-2012 Mikiya Fujii; additional MolDS contributors as recorded
+by the Debian copyright metadata.
+Upstream license for the relevant MolDS files: GPL-3.0-or-later.
+
+The xndo-rs transcriptions are located at:
+  src/data/molds_cndo2_indo_parameters.csv
+  src/data/molds_zindo_s_parameters.csv
+
+The method label `INDO` is retained exactly as used by MolDS. xndo-rs does not
+infer that this dataset is specifically INDO/1 or INDO/2 without a separate
+convention audit.
+
+Runtime use in xndo-rs 0.2.3
+-----------------------------
+`src/cndo_indo.rs` consumes `molds_cndo2_indo_parameters.csv` directly. CNDO/2
+is enabled for H/Li/C/N/O/S. Ground-state INDO is enabled for H/Li/C/N/O only; the
+shared sulfur row is not interpreted as a complete INDO one-centre parameter
+set. Bare `indo` is therefore a distinct executable method and never an alias
+for ZINDO/S.

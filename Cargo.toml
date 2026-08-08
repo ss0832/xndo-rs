@@ -1,0 +1,52 @@
+[package]
+name = "xndo-rs"
+version = "0.2.4"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["xndo-rs contributors"]
+description = "Rust/Python legacy semiempirical quantum chemistry library for MNDO-family, MINDO, ZINDO/INDO and related NDO models."
+readme = "README.md"
+homepage = "https://pypi.org/project/xndo-rs-python/"
+include = [
+    "/src/**",
+    "/tests/*.rs",
+    "/tests/*.py",
+    "/examples/*.xyz",
+    "/tools/**/*.py",
+    "/tools/**/*.xyz",
+    "/python/**/*.py",
+    "/docs/*.md",
+    "/third_party/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/THIRD_PARTY_NOTICES.md",
+    "/VALIDATION_STATUS.md",
+]
+autobins = false
+
+[lib]
+name = "xndo_rs"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "xndo_rs_cli"
+path = "src/bin/xndo_rs.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[dependencies]
+faer = { version = "0.24", default-features = false, features = ["std", "linalg", "rayon"] }
+rayon = "1.10"
+pyo3 = { version = "0.23.5", optional = true, features = ["extension-module", "abi3-py39"] }
+
+[features]
+default = []
+python = ["pyo3"]

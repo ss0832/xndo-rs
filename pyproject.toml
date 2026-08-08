@@ -1,0 +1,58 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "xndo-rs-python"
+version = "0.2.4"
+description = "Rust/Python legacy semiempirical quantum chemistry: CNDO/2, INDO, MNDO, MNDO/d, MINDO/3, ZINDO/S and legacy NDO families"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "xndo-rs contributors" }]
+dependencies = ["numpy>=1.21"]
+keywords = [
+  "computational-chemistry",
+  "semiempirical",
+  "quantum-chemistry",
+  "MNDO",
+  "ZINDO",
+  "UV-vis",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/xndo-rs-python/"
+
+[project.optional-dependencies]
+ase = ["ase>=3.22"]
+test = ["pytest>=7", "ase>=3.22"]
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "xndo_rs._native"
+include = [
+  "CHANGELOG.md",
+  "THIRD_PARTY_NOTICES.md",
+  "VALIDATION_STATUS.md",
+  "docs/*.md",
+  "third_party/mopac/LICENSE",
+  "third_party/mopac7/NOTICE",
+  "third_party/molds/NOTICE",
+]

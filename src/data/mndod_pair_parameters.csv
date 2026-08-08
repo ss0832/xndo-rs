@@ -1,0 +1,14 @@
+# PROVENANCE: extracted from OpenMOPAC (Molecular Orbital PACkage)
+# source repo: https://github.com/openmopac/mopac  tag: v23.2.5
+# source file: src/models/alpb_and_xfac_mndod.F90
+# source license: Apache-2.0
+# extraction script: tools/extract_xndo_params.py
+zi,zj,alpb,xfac
+11,1,1.05225212e0,1.00000000e0
+11,6,1.05225212e0,1.00000000e0
+12,1,1.35052992e0,1.00000000e0
+12,6,1.48172071e0,1.00000000e0
+13,1,1.38788000e0,1.00000000e0
+13,6,1.38788000e0,1.00000000e0
+13,13,1.38788000e0,1.00000000e0
+16,12,1.48172071e0,1.00000000e0

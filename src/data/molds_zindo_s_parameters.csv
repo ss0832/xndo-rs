@@ -1,0 +1,11 @@
+# PROVENANCE: MolDS 0.3.1, src/base/atoms/{H,C,N,O,S}atom.cpp
+# UPSTREAM: https://sources.debian.org/src/molds/0.3.1-3/src/base/atoms/
+# LICENSE: GPL-3.0-or-later (MolDS upstream); see third_party/molds/NOTICE
+# SCOPE: independent H/C/N/O/S ZINDO/S parameter subset. This does not replace the broader OpenMOPAC-derived src/data/zindo_s_parameters.csv; it is bundled for reusable legacy data and cross-validation.
+# UNITS: beta/F0/IP are eV. Slater-Condon values retain their upstream numerical value and explicit source unit because MolDS stores H/C/N/O and S using different input unit conventions before conversion to atomic units.
+z,sym,z_eff_k,z_eff_l,z_eff_msp,z_eff_md,beta_s_ev,beta_d_ev,f0ss_ev,f0sd_ev,f0dd_ev,g1sp_value,g1sp_unit,f2pp_value,f2pp_unit,g2sd_value,g2sd_unit,g1pd_value,g1pd_unit,f2pd_value,f2pd_unit,g3pd_value,g3pd_unit,f2dd_value,f2dd_unit,f4dd_value,f4dd_unit,zindo_l,zindo_m,zindo_n,ion_pot_s_ev,ion_pot_p_ev,ion_pot_d_ev,source_file,source_variant
+1,H,1.2,0.0,0.0,0.0,-12.0,0.0,12.85,0.0,0.0,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,1,0,0,13.06,0.0,0.0,Hatom.cpp,MolDS-active
+6,C,5.7,3.25,0.0,0.0,-17.0,0.0,11.11,0.0,0.0,55635,cm^-1,36375,cm^-1,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,2,2,0,19.84,10.93,0.0,Catom.cpp,MolDS-active
+7,N,6.7,3.90,0.0,0.0,-26.0,0.0,12.01,0.0,0.0,72255,cm^-1,52100,cm^-1,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,2,3,0,25.69,14.05,0.0,Natom.cpp,MolDS-active
+8,O,7.70,4.55,0.0,0.0,-34.0,0.0,13.00,0.0,0.0,95298,cm^-1,55675,cm^-1,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,2,4,0,32.90,17.28,0.0,Oatom.cpp,MolDS-active
+16,S,15.70,11.85,5.775,5.193,-15.0,0.0,10.09,0.0,0.0,3.0756,eV,4.5377,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,0.0,eV,2,4,0,21.11,12.39,4.11,Satom.cpp,ORCA-2.8-set-active-in-MolDS

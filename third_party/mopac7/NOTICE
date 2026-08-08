@@ -1,0 +1,22 @@
+MOPAC7 MINDO/3 parameter-data provenance
+=========================================
+
+xndo-rs 0.2.3 retains a consolidated machine-readable MINDO/3 atomic and
+atom-pair parameter table cross-checked against the public-domain MOPAC7 source.
+
+Upstream source mirror:
+  https://sources.debian.org/src/mopac7/1.15-4/fortran/block.f/
+Public-domain status is stated in the MOPAC7 program source and in the MOPAC7
+project distribution metadata.
+
+Public-domain notice:
+  https://sources.debian.org/src/mopac7/1.15-4/fortran/mopac7app.f/
+OpenMOPAC historical distribution statement:
+  https://openmopac.net/Manual/cooperative_development.html
+
+The xndo-rs tables are:
+  src/data/mindo3_parameters.csv
+  src/data/mindo3_pair_parameters.csv
+
+The atom-pair table follows MOPAC7 BETA3/ALP3 bond-type indices. In particular,
+P-Cl, S-Cl and Cl-Cl correspond to the distinct tail entries 151, 152 and 153.
