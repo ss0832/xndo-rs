@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! MNDO core-core repulsion, matching the MNDO branches of MOPAC `ccrep.F90`.
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/integrals/ccrep.F90.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! rewritten generically over `Scalar`; MNDO/d takes upstream's pair-fitted
+//! branch.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
-use crate::constants::{BOHR_TO_ANGSTROM, HARTREE_TO_EV};
+use crate::constants::BOHR_TO_ANGSTROM;
 use crate::dual::{Dual, Scalar};
 use crate::error::Result;
 use crate::math::Vec3;
+use crate::method::Method;
 use crate::params::{NddoElement, NddoParameters};
 use crate::system::Molecule;
 
@@ -66,7 +76,7 @@ pub fn pair_core_energy_scalar<S: Scalar>(
     // This differs from the electron-electron `am` path for Cb and from
     // `po(1)` for elements carrying a core additive override.
     let rho = ei.po[9] + ej.po[9];
-    let gab = (distance_bohr * distance_bohr + rho * rho).sqrt().recip() * HARTREE_TO_EV;
+    let gab = (distance_bohr * distance_bohr + rho * rho).sqrt().recip() * ei.hartree_ev;
     let core_product = ei.core_charge * ej.core_charge;
     let bare_energy = gab * core_product;
 
@@ -87,7 +97,37 @@ pub fn pair_core_energy_scalar<S: Scalar>(
         } else {
             entry.alpha
         };
-        let scale = S::cst(1.0) + (distance_angstrom * -alpha).exp() * (2.0 * entry.x);
+        // MNDO and MNDO/d take *different* forms for a pair-fitted interaction
+        // (MOPAC `ccrep.F90`: the `1 + 2 fff exp(-alpb R)` form sits behind
+        // `.not. method_mndod`, and MNDO/d has its own branch at :134-149).
+        //
+        // MNDO/d uses `alpb` as the alpha of one element only, and the
+        // per-element `alp` of the other:
+        //
+        //   ni == nj   scale = 1 + 2 exp(-alpb R)
+        //   otherwise  scale = 1 + exp(-alpb R) + exp(-alp(other) R)
+        //
+        // where `other` is whichever partner is not Na, Mg or Al. MOPAC spells
+        // that as a `select case (nj)` over 11, 12, 13 picking `alp(ni)` and
+        // otherwise `alp(nj)`; every heteronuclear pair in the MNDO/d table has
+        // exactly one of Na, Mg or Al, so the choice is well defined and
+        // independent of which atom is passed first.
+        let scale = if params.method == Method::MndoD {
+            if zi == zj {
+                S::cst(1.0) + (distance_angstrom * -alpha).exp() * 2.0
+            } else {
+                let other = if matches!(zj, 11..=13) {
+                    ei.alpha
+                } else {
+                    ej.alpha
+                };
+                S::cst(1.0)
+                    + (distance_angstrom * -alpha).exp()
+                    + (distance_angstrom * -other).exp()
+            }
+        } else {
+            S::cst(1.0) + (distance_angstrom * -alpha).exp() * (2.0 * entry.x)
+        };
         bare_energy * scale
     } else {
         let exp_i = (distance_angstrom * -ei.alpha).exp();

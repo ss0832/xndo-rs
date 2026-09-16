@@ -9,6 +9,13 @@
 | MINDO/3 | native | H, B, C, N, O, F, Si, P, S, Cl | RHF/UHF energy, gradient, optimization, Hessian, frequencies |
 | ZINDO/S | native | 1-AO/4-AO s/p branch | RHF/UHF ground optimization/derivatives, RHF-CIS/UCIS UV-vis properties and state derivatives |
 
+Every native method additionally reports orbital energies, occupations and the
+HOMO/LUMO pair, and can write a Molden wavefunction file. ZINDO/S rejects
+elements that would need its unimplemented d branch for Molden output, rather
+than writing a file missing their d coefficients.
+
+No correlated method is implemented. See `docs/scope.md`.
+
 `INDO` means the unversioned MolDS-compatible ground-state model. It is not an
 alias for `INDO/S`; the latter parses as ZINDO/S.
 

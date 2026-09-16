@@ -33,22 +33,28 @@ pub mod error;
 pub mod fock;
 pub mod frame;
 pub mod gradient;
+pub mod gto;
 pub mod hamiltonian;
 pub mod hessian;
 pub mod integrals;
 pub mod integrals_d;
+pub mod licenses;
 pub mod linalg;
 pub mod math;
 pub mod method;
 pub mod mindo3;
+pub mod molden;
 pub mod onecenter;
 pub mod optimizer;
+pub mod orbitals;
 pub mod overlap;
 pub mod overlap_numeric;
 pub mod params;
 pub mod repulsion;
 pub mod rotations;
 pub mod scf;
+pub mod scf_accel;
+pub mod sto;
 pub mod system;
 pub mod xndo;
 mod zdo_gradient;
@@ -66,6 +72,7 @@ pub use hessian::{
     analytic_hessian, numerical_hessian, vibrational_analysis, vibrational_analysis_from_hessian,
     VibrationalModes,
 };
+pub use licenses::{license_summary, print_licenses, third_party_licenses, LicenseDocument};
 pub use linalg::Matrix;
 pub use math::{Mat3, Vec3};
 pub use method::{methods_for_api, Method, MethodStatus};
@@ -73,15 +80,17 @@ pub use mindo3::{
     element as mindo3_element, pair as mindo3_pair, run_mindo3, Mindo3Element, Mindo3Options,
     Mindo3Result,
 };
+pub use molden::{molden_string, write_molden, MoldenCoefficients};
 pub use optimizer::{optimize, OptOptions, OptResult, OptStep};
+pub use orbitals::OrbitalEnergies;
 pub use params::{NddoElement, NddoParameters, PairParams};
 pub use scf::{
     run_nddo_with_parameters, NddoCalculator, NddoOptions, NddoResult, Reference, ScfAccelerator,
 };
 pub use system::{symbol_to_z, z_to_symbol, Atom, Molecule};
 pub use xndo::{
-    run_gradient, run_hessian, run_method, run_nddo, CalculationResult, MethodGradientResult,
-    MethodHessianResult,
+    run_gradient, run_hessian, run_method, run_nddo, run_orbitals, CalculationResult,
+    MethodGradientResult, MethodHessianResult,
 };
 pub use zindo::{
     run_zindo_s, uv_vis_spectrum, zindo_s_cis, zindo_s_cis_gradients, zindo_s_cis_hessians,

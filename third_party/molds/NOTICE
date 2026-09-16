@@ -28,3 +28,21 @@ is enabled for H/Li/C/N/O/S. Ground-state INDO is enabled for H/Li/C/N/O only; t
 shared sulfur row is not interpreted as a complete INDO one-centre parameter
 set. Bare `indo` is therefore a distinct executable method and never an alias
 for ZINDO/S.
+
+Vendored regression outputs (added in 0.3.0)
+--------------------------------------------
+
+third_party/molds/tests/ holds five of the regression cases MolDS 0.3.1 ships
+in its own test/ directory, copied verbatim:
+
+  ch4_cndo2.{in,dat}   c2h6_cndo2.{in,dat}   h2s_cndo2.{in,dat}
+  ch4_indo.{in,dat}    c2h6_indo.{in,dat}
+
+They are the upstream author's own inputs and outputs, kept so that the CNDO/2
+and INDO oracle suites can be regenerated and re-checked without a local MolDS
+build. They are covered by the same GPL-3.0-or-later terms as the rest of MolDS,
+which is compatible with this project's licence; nothing in them is modified.
+
+They are read by tools/oracle/run_molds.py and turned into
+tests/data/molds_cndo2_reference.tsv and tests/data/molds_indo_reference.tsv.
+See tests/data/ORACLE_NOTES.md item 24 for what is compared and what is not.

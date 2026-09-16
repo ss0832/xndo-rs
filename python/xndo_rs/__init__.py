@@ -3,6 +3,9 @@
 from . import native
 
 single_point = native.single_point
+orbital_energies = native.orbital_energies
+molden = native.molden
+third_party_licenses = native.third_party_licenses
 gradient = native.gradient
 forces = native.forces
 optimize = native.optimize
@@ -19,9 +22,10 @@ parameter_datasets = native.parameter_datasets
 parameter_dataset = native.parameter_dataset
 
 __all__ = [
-    "native", "single_point", "gradient", "forces", "optimize",
+    "native", "single_point", "orbital_energies", "molden", "gradient", "forces", "optimize",
     "frequencies", "hessian", "excited_states", "excited_properties",
     "uv_vis_spectrum", "excited_state_gradients", "excited_state_hessians",
     "available_methods", "api_methods", "parameter_datasets", "parameter_dataset",
+    "third_party_licenses",
 ]
-__version__ = "0.2.4"
+__version__ = "0.3.0"

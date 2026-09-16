@@ -24,7 +24,7 @@ MolDS provides CNDO/2 for H, Li, C, N, O, and S. Its ground-state INDO path is
 enabled only for H, Li, C, N, and O because the sulfur row is not treated as a
 complete INDO one-center set.
 
-OpenMOPAC's ZINDO/S table contains transition-metal entries, but 0.2.4 gates
+OpenMOPAC's ZINDO/S table contains transition-metal entries, but 0.3.0 still gates
 the irregular 9-AO d-shell path because its additional Hamiltonian machinery
 is not implemented. A table row alone is not considered implementation
 evidence.

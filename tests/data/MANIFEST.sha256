@@ -1,0 +1,16 @@
+# SHA-256 of the oracle reference files and of the generator that produced them.
+# Checked by tests/oracle_matrix.rs without needing the oracle binary, so a
+# hand-edited reference file, or a generator edited without regenerating, fails
+# in every checkout. See tests/data/ORACLE_NOTES.md section (d).
+df3ae960f782abac34175b4a3c9fb142e9adb44ef585a55c2669fb7e67ad0d78  tests/data/mopac_mndo_reference.tsv
+cc25f0f4cfeee2c963db3ba083ae108383b24e68e244a91dfd12a1e769515d35  tests/data/mopac_mndod_reference.tsv
+db569c2711ff6c695b5ed26350fb878d49f2b0f1a9a88675f5d6537cfe5144b9  tests/data/mopac_zindo_reference.tsv
+d880177d672a7012eca4d7474696091ee28f7e12eec484bdbc45ec767aad3467  tests/data/mopac_zindo_cis_reference.tsv
+8b3d922988df8304b259b51092bcd916e03686f388d65a5b2a51d9fc08352acb  tests/data/molds_cndo2_reference.tsv
+60bf1fd8956db3a950cd5f6fc65ec8e721056f002e6a919c0e0046d391f76f4e  tests/data/molds_indo_reference.tsv
+eded17eefc157d68d47e4449f61c6bf019f16444e5c7b7a545311969763e45bf  tests/data/mopac7_mindo3_reference.tsv
+abc9804250356162143e6494fdbff6da836f2fbfc5e209363fdcadbaa722b287  tools/oracle/build_reference_set.py
+ba970aec0afcd65ed01516da86aa392274c77510ecf0ce9b014c0cbdfbd77a53  tools/oracle/geometry_builders.py
+b9c2c62e19b329b392d8893204228470e024e411129b29a27f04ec539bd8aec6  tools/oracle/run_mopac.py
+f32dc18c115b8a313608e23c21c1a0780fd725e479ba703db2de38b3dd47a15a  tools/oracle/run_molds.py
+e0b93d9b75562c29e0d8344a199a13c1c55c1a99d94efcf615c205d7c10b58cd  tools/oracle/run_mopac7.py

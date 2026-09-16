@@ -1,0 +1,167 @@
+xndo-rs
+Copyright 2026 the xndo-rs authors
+Licensed under the GNU General Public License, version 3 or later.
+
+This file retains the copyright and attribution notices of the upstream works
+xndo-rs derives from. It exists because those notices are required to be
+carried, not merely pointed at: Apache-2.0 section 4(c) requires retaining the
+attribution notices of a derived work, and GPL-3.0 section 5(a) requires
+carrying prominent notices of modification. Removing anything below breaks those
+terms.
+
+The machine-readable file-by-file mapping is in `THIRD_PARTY_NOTICES.md`. The
+licence texts are in `LICENSES/`. Rust crate licences, reproduced verbatim from
+what each crate ships, are in `THIRD_PARTY_LICENSES_RUST.md`.
+
+
+================================================================================
+OpenMOPAC (MOPAC) v23.2.5 -- Apache-2.0
+================================================================================
+
+Every Fortran source file in OpenMOPAC v23.2.5 carries this header. It is
+reproduced verbatim because it is the attribution notice Apache-2.0 4(c)
+requires xndo-rs to retain:
+
+    ! Molecular Orbital PACkage (MOPAC)
+    ! Copyright 2021 Virginia Polytechnic Institute and State University
+    !
+    ! Licensed under the Apache License, Version 2.0 (the "License");
+    ! you may not use this file except in compliance with the License.
+    ! You may obtain a copy of the License at
+    !
+    !    http://www.apache.org/licenses/LICENSE-2.0
+    !
+    ! Unless required by applicable law or agreed to in writing, software
+    ! distributed under the License is distributed on an "AS IS" BASIS,
+    ! WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    ! See the License for the specific language governing permissions and
+    ! limitations under the License.
+
+Upstream: https://github.com/openmopac/mopac  (tag v23.2.5)
+Licence text: LICENSES/Apache-2.0.txt, and the upstream copy at
+              third_party/mopac/LICENSE
+
+Citation, from the upstream CITATION.cff:
+
+    MOPAC, version 23.2.5
+    Jonathan E. Moussa, James J. P. Stewart, and contributors
+    DOI 10.5281/zenodo.6511958
+    JOSS DOI 10.21105/joss.08025
+
+The full upstream author list is retained at third_party/mopac/AUTHORS.rst.
+
+The `src/INDO/` subtree that xndo-rs's ZINDO/S engine derives from has its own
+lineage, which upstream's own `src/INDO/README.md` records and which is carried
+here because attribution does not stop at the most recent author:
+
+    the MOPAC INDO/S and CI code is by Rebecca Gieseking,
+    derived from the CNDO/INDO program of Jeffrey R. Reimers
+    (DOI:10.4231/D3R49G96G),
+    itself derived from the CNDO/S program of Del Bene, Jaffe,
+    Ellis and Kuehnlenz (QCPE Program 174).
+
+xndo-rs contains **line-level ports of OpenMOPAC Fortran into Rust**, not only
+extracted parameter data. The per-file record, including which upstream `.F90`
+each Rust file derives from and the date it was modified, is in
+`THIRD_PARTY_NOTICES.md` and in a `PROVENANCE:` header at the top of each file.
+
+OpenMOPAC v23.2.5 does **not** ship a NOTICE file, so Apache-2.0 4(d) imposes no
+obligation to propagate one. That absence is recorded, with evidence, in
+third_party/mopac/PROVENANCE.md. No file named `third_party/mopac/NOTICE` exists
+in this tree, and none should be created: putting one there would assert that
+upstream published a NOTICE and would impose its propagation on every downstream
+recipient.
+
+
+================================================================================
+MolDS 0.3.1 -- GPL-3.0-or-later
+================================================================================
+
+    Copyright (C) 2011-2012 Mikiya Fujii
+    Copyright (C) 2012-2013 Katsuhiko Nishimra
+
+    MolDS is free software: you can redistribute it and/or modify it under the
+    terms of the GNU General Public License as published by the Free Software
+    Foundation, either version 3 of the License, or (at your option) any later
+    version.
+
+Upstream: https://sources.debian.org/src/molds/0.3.1-3/
+Original project: https://osdn.net/projects/molds/
+Licence text: LICENSES/GPL-3.0-or-later.txt
+
+xndo-rs's CNDO/2 and INDO engines are ports of MolDS, and its ZINDO/S and
+CNDO/INDO parameter subsets are transcribed from it. Five of the regression
+input/output pairs MolDS ships are retained verbatim under
+third_party/molds/tests/, and are used to verify that a locally built MolDS
+reproduces its author's own numbers before it is trusted as an oracle.
+
+Further detail: third_party/molds/NOTICE.
+
+
+================================================================================
+MOPAC7 1.15 -- public domain
+================================================================================
+
+MOPAC7 is in the public domain. Its MINDO/3 tables (`fortran/block.f`) are the
+declared upstream of `src/data/mindo3_parameters.csv` and
+`src/data/mindo3_pair_parameters.csv`, and the constants it uses -- a Bohr
+radius of 0.529167 A and a Hartree of 27.21 eV -- are part of the MINDO/3 model
+as implemented here.
+
+Upstream: https://sources.debian.org/src/mopac7/1.15-4/fortran/
+Further detail: third_party/mopac7/NOTICE. The tables carry no deviation from
+upstream; the one this file used to declare, in `hp2_ev`, was fixed in v0.3.0
+(tests/data/ORACLE_NOTES.md item 4).
+
+
+================================================================================
+Stewart STO-nG expansions, and xtb's slaterToGauss -- src/sto.rs
+================================================================================
+
+`src/sto.rs` expands a Slater-type orbital as a sum of Gaussians, which is what
+makes Molden output possible: every engine here works in a Slater basis and the
+Molden format describes a Gaussian one.
+
+The expansion coefficients are
+
+    R. F. Stewart, "Small Gaussian Expansions of Slater-Type Orbitals",
+    J. Chem. Phys. 52, 431-438 (1970)
+
+-- published least-squares fits, reproduced as cited numerical facts. A table of
+fitted constants in a subscription journal carries no licence to propagate, and
+claiming one here would impose an obligation on every downstream recipient that
+the source itself does not.
+
+The *arrangement* is a different question, and is recorded rather than left
+unsaid. The fifteen-row table layout, the n/l index arithmetic, the separate
+STO-6G tables for 6s and 6p, and the zeta^2 scaling and Cartesian normalisation
+in `slater_to_gauss` follow xtb's `slaterToGauss`:
+
+    https://github.com/grimme-lab/xtb  --  LGPL-3.0-or-later
+
+LGPL-3.0-or-later material may be incorporated into a GPL-3.0-or-later work, and
+the licence text is carried at LICENSES/LGPL-3.0-or-later.txt on that basis.
+
+The immediate source of the port is gfn2-rs `src/sto.rs`, by the same authors
+and under the same GPL-3.0-or-later licence as this crate.
+
+
+================================================================================
+Rust crates
+================================================================================
+
+Roughly ninety crates are linked into the library and binaries. Their licences
+are reproduced verbatim in THIRD_PARTY_LICENSES_RUST.md, generated by
+tools/collect_rust_licenses.py from the files each crate actually ships.
+
+One deserves naming here, because trusting the metadata instead of the files
+would have lost an obligation. `faer`, a direct dependency present in every
+artifact, declares `license = "MIT"`, but ships:
+
+    COPYING.EIGEN.MPL2              Mozilla Public License 2.0
+    COPYING.LAPACK.BSD              BSD 3-clause
+    COPYING.SUITE_SPARSE.AMD.BSD    BSD 3-clause
+    COPYING.SUITE_SPARSE.COLAMD.BSD BSD 3-clause
+
+because parts of it are ported from Eigen, LAPACK and SuiteSparse. The MPL-2.0
+obligation is real and is recorded here and in LICENSES/MPL-2.0.txt.

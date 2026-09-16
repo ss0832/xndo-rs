@@ -17,9 +17,15 @@
 //! Orbital-pair index (1-based in MOPAC) `pack(a,b) = a(a-1)/2 + b`; here we use
 //! the 0-based [`crate::integrals::pack`].
 //!
-//! PROVENANCE: openmopac/mopac v23.2.5 (Apache-2.0). See THIRD_PARTY_NOTICES.md.
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/integrals/mndod.F90 (`rsc`, `scprm`, `inighd`, `wstore`, `eiscor`) and src/integrals/mndod_C.F90.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! the energy prefactor is carried per parameter set rather than being a
+//! global constant.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
-use crate::constants::HARTREE_TO_EV;
 use crate::integrals::pack;
 use crate::params::NddoElement;
 
@@ -31,10 +37,15 @@ pub const NPAIR: usize = 45;
 struct Combinatorics {
     fx: [f64; 31],
     b: [[f64; 31]; 31],
+    /// Energy prefactor of the parameter set these integrals belong to; see
+    /// [`crate::constants::ModelConstants`]. The exponents reaching `rsc` are
+    /// already in the internal Bohr, so this is the *effective* Hartree, not
+    /// the model's own.
+    ev: f64,
 }
 
 impl Combinatorics {
-    fn new() -> Self {
+    fn new(ev: f64) -> Self {
         let mut fx = [0.0; 31];
         fx[1] = 1.0;
         for i in 2..=30 {
@@ -49,7 +60,7 @@ impl Combinatorics {
                 b[i][j] = b[i - 1][j - 1] + b[i - 1][j];
             }
         }
-        Self { fx, b }
+        Self { fx, b, ev }
     }
 
     /// SlaterCondon radial integral `R^k(ab,cd)` in eV (`rsc`, mndod.F90:1570).
@@ -83,7 +94,7 @@ impl Combinatorics {
                 * fx[(2 * nc + 1) as usize]
                 * fx[(2 * nd + 1) as usize])
                 .sqrt();
-        let c = HARTREE_TO_EV
+        let c = self.ev
             * ff
             * (na as f64 * aea
                 + nb as f64 * aeb
@@ -127,8 +138,9 @@ pub fn slater_rsc(
     ec: f64,
     nd: i32,
     ed: f64,
+    hartree_ev: f64,
 ) -> f64 {
-    Combinatorics::new().rsc(k, na, ea, nb, eb, nc, ec, nd, ed)
+    Combinatorics::new(hartree_ev).rsc(k, na, ea, nb, eb, nc, ec, nd, ed)
 }
 
 /// One-center spd two-electron integral matrix for one element.
@@ -329,7 +341,7 @@ fn eiscor_coeffs(z: u8) -> (f64, f64, f64, f64, f64) {
 impl OneCenterSpd {
     /// Build the one-center two-electron matrix for a 9-orbital element.
     pub fn build(elem: &NddoElement) -> Self {
-        let cmb = Combinatorics::new();
+        let cmb = Combinatorics::new(elem.hartree_ev);
         let (repd, f0sd, g2sd, eisol_d) = build_repd(elem, &cmb);
 
         let mut w = vec![vec![0.0f64; NPAIR]; NPAIR];
@@ -388,7 +400,7 @@ mod tests {
 
     #[test]
     fn combinatorics_factorials() {
-        let c = Combinatorics::new();
+        let c = Combinatorics::new(crate::constants::HARTREE_TO_EV);
         assert_eq!(c.fx[1], 1.0); // 0!
         assert_eq!(c.fx[2], 1.0); // 1!
         assert_eq!(c.fx[4], 6.0); // 3!

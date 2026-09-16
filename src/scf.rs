@@ -7,16 +7,28 @@
 //! The initial density is a **superposition of atomic densities** (`sad_density`): the
 //! exact free-atom density in a minimal valence basis, far better than the bare-core guess
 //! and charge convergence is accelerated with the A-DIIS/CDIIS hybrid on the `[F,P]` commutator.
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/SCF and src/models/parameters_C.F90 (shell occupancies).
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! A-DIIS/CDIIS acceleration and the superposition-of-atomic-densities guess
+//! are this project's; the shell occupancies, the helium exception and the
+//! heat-of-formation convention follow upstream.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 use crate::basis::Basis;
-use crate::constants::{AU_DIPOLE_TO_DEBYE, EV_TO_KCAL};
 use crate::error::{Result, XndoError};
 use crate::fock::{build_fock, build_fock_spin};
 use crate::hamiltonian::{build_core_limited, CoreHamiltonian};
 use crate::linalg::{symmetric_eigen, Matrix};
 use crate::math::Vec3;
+use crate::orbitals::OrbitalEnergies;
 use crate::params::NddoParameters;
 use crate::repulsion::core_core_energy;
+pub use crate::scf_accel::ScfAccelerator;
+use crate::scf_accel::{lowest_solution, open_shell_starts, uniform_valence_density, Accelerator};
 use crate::system::Molecule;
 
 /// Choice of SCF reference (restricted vs unrestricted), independent of the
@@ -29,19 +41,6 @@ pub enum Reference {
     Auto,
     Rhf,
     Uhf,
-}
-
-/// SCF charge-convergence accelerator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScfAccelerator {
-    /// No extrapolation (plain iteration).
-    None,
-    /// Pulay CDIIS on the `[F,P]` commutator throughout.
-    Cdiis,
-    /// **A-DIIS** (Hu & Yang, *J. Chem. Phys.* **132**, 054109 (2010)) while far from
-    /// convergence, switching to CDIIS once the commutator error drops below a threshold
-    /// the robust hybrid recommended for hard cases (radicals, small gaps, poor guesses).
-    AdiisCdiis,
 }
 
 #[derive(Clone, Debug)]
@@ -139,40 +138,6 @@ pub(crate) fn pair_cache_limit(options: &NddoOptions) -> usize {
     }
 }
 
-/// Deepest convergence-accelerator history the SCF will keep.
-const MAX_DIIS_DEPTH: usize = 8;
-
-/// Effective DIIS depth under the configured memory budget.
-///
-/// A depth-`k` history holds `k` Fock matrices, `k` error matrices and (for
-/// A-DIIS) `k` densities  `3 k nao2` doubles. At `nao = 4800` the full depth
-/// is 4.4 GiB, which is an out-of-memory abort on most machines; trimming the
-/// depth costs a few extra iterations instead. Never drops below 2, the
-/// minimum for any extrapolation.
-fn diis_depth(nao: usize, matrices_per_slot: usize, budget_mb: usize) -> usize {
-    if budget_mb == 0 {
-        return MAX_DIIS_DEPTH;
-    }
-    let per_slot = slot_bytes(nao, matrices_per_slot);
-    if per_slot == 0 {
-        return MAX_DIIS_DEPTH;
-    }
-    let budget = budget_mb.saturating_mul(1024 * 1024);
-    (budget / per_slot).clamp(2, MAX_DIIS_DEPTH)
-}
-
-fn slot_bytes(nao: usize, matrices_per_slot: usize) -> usize {
-    matrices_per_slot
-        .saturating_mul(nao)
-        .saturating_mul(nao)
-        .saturating_mul(std::mem::size_of::<f64>())
-}
-
-/// Whether the minimum useful history (depth 2) fits the budget.
-fn diis_depth_fits(nao: usize, matrices_per_slot: usize, budget_mb: usize) -> bool {
-    budget_mb == 0 || 2 * slot_bytes(nao, matrices_per_slot) <= budget_mb * 1024 * 1024
-}
-
 /// Apply a SaundersHillier level shift to a Fock matrix before diagonalization:
 /// `F' = F + shift(I  P)`, raising the virtual space by ~`shift`. `P` is the
 /// (idempotent, orthonormal-basis) density projector for the spin channel
@@ -199,7 +164,14 @@ pub struct NddoResult {
     pub spin_density: Option<Matrix>,
     pub mo_energies: Vec<f64>,
     pub mo_coeff: Matrix,
+    /// Beta-channel eigenvalues (UHF only; `None` for RHF).
+    pub mo_energies_beta: Option<Vec<f64>>,
+    /// Beta-channel coefficients (UHF only; `None` for RHF).
+    pub mo_coeff_beta: Option<Matrix>,
+    /// Occupied alpha count; equals `n_alpha`, kept under the older name.
     pub n_occ: usize,
+    pub n_alpha: usize,
+    pub n_beta: usize,
     pub electronic_ev: f64,
     pub core_ev: f64,
     pub total_ev: f64,
@@ -207,12 +179,32 @@ pub struct NddoResult {
     pub charges: Vec<f64>,
     pub dipole_debye: Vec3,
     pub dipole_magnitude: f64,
+    /// Highest occupied spin orbital over *both* channels; see
+    /// [`crate::orbitals::OrbitalEnergies::homo_ev`].
     pub homo_ev: Option<f64>,
+    /// Lowest unoccupied spin orbital over *both* channels.
     pub lumo_ev: Option<f64>,
     pub iterations: usize,
     pub converged: bool,
     /// True when the UHF (open-shell) path was used.
     pub unrestricted: bool,
+}
+
+impl NddoResult {
+    /// The orbital energies and the frontier quantities read off them.
+    pub fn orbitals(&self) -> OrbitalEnergies {
+        OrbitalEnergies::new(
+            self.mo_energies.clone(),
+            self.n_alpha,
+            self.mo_energies_beta.clone(),
+            self.n_beta,
+        )
+    }
+
+    /// HOMO-LUMO gap in eV; `None` unless both frontier orbitals exist.
+    pub fn homo_lumo_gap_ev(&self) -> Option<f64> {
+        Some(self.lumo_ev? - self.homo_ev?)
+    }
 }
 
 pub struct NddoCalculator {
@@ -240,7 +232,10 @@ struct ScfState {
     spin_density: Option<Matrix>,
     mo_energies: Vec<f64>,
     mo_coeff: Matrix,
+    mo_energies_beta: Option<Vec<f64>>,
+    mo_coeff_beta: Option<Matrix>,
     n_occ: usize,
+    n_beta: usize,
     electronic_ev: f64,
     converged: bool,
     iterations: usize,
@@ -341,7 +336,22 @@ pub fn run_nddo_with_parameters(
         opts.d_penalty_start = d_pen;
         opts.d_penalty_iters = d_pen_iters;
         if use_uhf {
-            uhf_loop(molecule, &basis, params, &core, n_alpha, n_beta, &opts)
+            // One SCF per candidate start, keeping the lowest: an open shell's
+            // unpaired electron is assigned by the *first* Fock matrix, which a
+            // guess can order wrongly in a way converging harder never undoes.
+            // See `scf_accel::open_shell_starts`.
+            let sad = sad_density(molecule, &basis, params)?;
+            let uniform =
+                uniform_valence_density(basis.nao, &valence_shells(molecule, &basis, params)?);
+            lowest_solution(
+                open_shell_starts(&sad, &uniform, n_alpha, n_beta),
+                |start| {
+                    uhf_loop(
+                        molecule, &basis, params, &core, n_alpha, n_beta, &opts, start,
+                    )
+                },
+                |state| state.electronic_ev,
+            )
         } else {
             rhf_loop(molecule, &basis, params, &core, n_alpha, &opts)
         }
@@ -383,7 +393,7 @@ pub fn run_nddo_with_parameters(
         e_isol_sum += e.e_isol;
         eheat_sum += e.eheat_ev;
     }
-    let heat_of_formation_kcal = (total_ev - e_isol_sum + eheat_sum) * EV_TO_KCAL;
+    let heat_of_formation_kcal = (total_ev - e_isol_sum + eheat_sum) * params.constants.ev_to_kcal;
 
     if !state.converged {
         return Err(XndoError::ScfNotConverged {
@@ -435,19 +445,31 @@ pub fn run_nddo_with_parameters(
             }
         }
     }
-    let dipole_debye = dip * AU_DIPOLE_TO_DEBYE;
+    let dipole_debye = dip * params.constants.debye_per_e_bohr();
     let dipole_magnitude = dipole_debye.norm();
 
-    let nao = basis.nao;
-    let homo_ev = (state.n_occ >= 1).then(|| state.mo_energies[state.n_occ - 1]);
-    let lumo_ev = (state.n_occ < nao).then(|| state.mo_energies[state.n_occ]);
+    // Frontier pair over both spin channels. Reading the alpha channel alone
+    // (what this returned before v0.3.0) gives the lowest unoccupied *alpha*
+    // orbital, which for an open shell is above the beta LUMO.
+    let orbitals = OrbitalEnergies::new(
+        state.mo_energies.clone(),
+        state.n_occ,
+        state.mo_energies_beta.clone(),
+        state.n_beta,
+    );
+    let homo_ev = orbitals.homo_ev();
+    let lumo_ev = orbitals.lumo_ev();
 
     Ok(NddoResult {
         density: state.density,
         spin_density: state.spin_density,
         mo_energies: state.mo_energies,
         mo_coeff: state.mo_coeff,
+        mo_energies_beta: state.mo_energies_beta,
+        mo_coeff_beta: state.mo_coeff_beta,
         n_occ: state.n_occ,
+        n_alpha: state.n_occ,
+        n_beta: state.n_beta,
         electronic_ev,
         core_ev,
         total_ev,
@@ -494,6 +516,27 @@ fn sad_density(molecule: &Molecule, basis: &Basis, params: &NddoParameters) -> R
         }
     }
     Ok(p)
+}
+
+/// `(first AO index, AO count, core charge)` per atom, the shape the shared
+/// guess builders in [`crate::scf_accel`] take.
+fn valence_shells(
+    molecule: &Molecule,
+    basis: &Basis,
+    params: &NddoParameters,
+) -> Result<Vec<(usize, usize, f64)>> {
+    molecule
+        .atoms
+        .iter()
+        .enumerate()
+        .map(|(ia, atom)| -> Result<(usize, usize, f64)> {
+            Ok((
+                basis.atom_offset[ia],
+                basis.atom_norb[ia],
+                params.element(atom.z)?.core_charge,
+            ))
+        })
+        .collect()
 }
 
 /// Build a density `P = w _{k<n_occ} c_k c_kT` from MO coefficients (`w` = 2 for RHF, 1 for UHF).
@@ -550,146 +593,6 @@ fn reconcile_usize_metadata(
     })
 }
 
-/// DIIS error `[F,P] = FP  PF`.
-///
-/// `F` and `P` are both symmetric, so `PF = (FP)T` and the second `O(nao3)`
-/// matrix product is redundant: form `FP` once and antisymmetrize it in place.
-fn commutator(f: &Matrix, p: &Matrix) -> Matrix {
-    debug_assert_eq!(f.rows, p.rows);
-    let mut e = f.matmul(p);
-    let n = e.rows;
-    let data = e.as_mut_slice();
-    for i in 0..n {
-        data[i * n + i] = 0.0;
-        for j in 0..i {
-            let upper = data[j * n + i];
-            let lower = data[i * n + j];
-            data[i * n + j] = lower - upper;
-            data[j * n + i] = upper - lower;
-        }
-    }
-    e
-}
-
-/// Rolling history for the SCF convergence accelerators.
-///
-/// The Gram matrices the extrapolators need, `b[i][j] = <E_i,E_j>` for CDIIS
-/// and `m[i][j] = <D_i,F_j>` for A-DIIS, are maintained **incrementally**:
-/// only the new row and column are evaluated each iteration (`2k - 1` dot
-/// products instead of `2k^2`), and the A-DIIS difference matrices `D_i - D_n`
-/// and `F_j - F_n` are never materialized. The previous formulation allocated
-/// `2k` full `nao x nao` temporaries per iteration, about 416 MiB of allocator churn
-/// per iteration at `nao = 1800`, which dominated the SCF wall time.
-struct AccelHistory {
-    depth: usize,
-    keep_densities: bool,
-    focks: Vec<Matrix>,
-    errors: Vec<Matrix>,
-    densities: Vec<Matrix>,
-    /// `E_i, E_j`, same order as `errors`.
-    b: Vec<Vec<f64>>,
-    /// `D_i, F_j`, same order as `densities`/`focks`.
-    m: Vec<Vec<f64>>,
-}
-
-impl AccelHistory {
-    fn new(depth: usize, keep_densities: bool) -> Self {
-        Self {
-            depth,
-            keep_densities,
-            focks: Vec::with_capacity(depth),
-            errors: Vec::with_capacity(depth),
-            densities: Vec::with_capacity(depth),
-            b: Vec::with_capacity(depth),
-            m: Vec::with_capacity(depth),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.focks.len()
-    }
-
-    /// Append one iterate, updating the Gram matrices with only the new
-    /// row/column, then drop the oldest entry if the depth is exceeded.
-    /// `density` is required exactly when the history keeps densities (A-DIIS).
-    /// Returns `E_new2`, which the Gram update computes anyway.
-    fn push(&mut self, fock: Matrix, error: Matrix, density: Option<Matrix>) -> f64 {
-        let mut b_row: Vec<f64> = self
-            .errors
-            .iter()
-            .map(|e| e.frobenius_dot(&error))
-            .collect();
-        let error_norm_sq = error.frobenius_dot(&error);
-        b_row.push(error_norm_sq);
-        for (i, row) in self.b.iter_mut().enumerate() {
-            row.push(b_row[i]);
-        }
-        self.b.push(b_row);
-
-        if let Some(density) = density.filter(|_| self.keep_densities) {
-            // New row `D_new, F_j` and new column `D_i, F_new`.
-            let mut m_row: Vec<f64> = self
-                .focks
-                .iter()
-                .map(|f| density.frobenius_dot(f))
-                .collect();
-            m_row.push(density.frobenius_dot(&fock));
-            for (row, d) in self.m.iter_mut().zip(&self.densities) {
-                row.push(d.frobenius_dot(&fock));
-            }
-            self.m.push(m_row);
-            self.densities.push(density);
-        }
-        self.focks.push(fock);
-        self.errors.push(error);
-
-        while self.focks.len() > self.depth {
-            self.focks.remove(0);
-            self.errors.remove(0);
-            self.b.remove(0);
-            for row in &mut self.b {
-                row.remove(0);
-            }
-            if self.keep_densities {
-                self.densities.remove(0);
-                self.m.remove(0);
-                for row in &mut self.m {
-                    row.remove(0);
-                }
-            }
-        }
-        error_norm_sq
-    }
-
-    /// Pulay CDIIS: extrapolated Fock from the stored `E_i,E_j` Gram matrix.
-    fn cdiis(&self) -> Option<Matrix> {
-        let coeffs = diis_coeffs_from_gram(&self.b)?;
-        Some(combine(&self.focks, &coeffs))
-    }
-
-    /// A-DIIS (Hu & Yang 2010) from the stored `D_i,F_j` Gram matrix.
-    fn adiis(&self) -> Option<Matrix> {
-        let n = self.len();
-        if n < 2 || !self.keep_densities {
-            return None;
-        }
-        let last = n - 1;
-        let mnn = self.m[last][last];
-        // d_i = D_i  D_n, F_n and s_ij = D_i  D_n, F_j  F_n, expanded
-        // from the stored inner products (no difference matrices formed).
-        let d: Vec<f64> = (0..n).map(|i| self.m[i][last] - mnn).collect();
-        let s: Vec<Vec<f64>> = (0..n)
-            .map(|i| {
-                (0..n)
-                    .map(|j| self.m[i][j] - self.m[i][last] - self.m[last][j] + mnn)
-                    .collect()
-            })
-            .collect();
-        let c = solve_adiis_simplex(&d, &s);
-        Some(combine(&self.focks, &c))
-    }
-}
-
 fn rms_diff(a: &Matrix, b: &Matrix) -> f64 {
     a.rms_difference(b)
 }
@@ -721,27 +624,7 @@ fn rhf_loop(
     };
     let timing = std::env::var("XNDO_TIMING").is_ok();
     let (mut t_fock, mut t_eigen, mut t_accel, mut t_density) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    // A-DIIS needs a density history on top of the Fock/error pair; plain CDIIS
-    // does not. When the budget cannot even hold a depth-2 A-DIIS history
-    // (`3  nao2` doubles per slot), degrade to CDIIS rather than blowing the
-    // budget: it is the weaker accelerator but reaches the same fixed point.
-    let mut keep_densities = accel == ScfAccelerator::AdiisCdiis;
-    if keep_densities && !diis_depth_fits(nao, 3, options.scf_memory_mb) {
-        keep_densities = false;
-    }
-    let accel = if accel == ScfAccelerator::AdiisCdiis && !keep_densities {
-        ScfAccelerator::Cdiis
-    } else {
-        accel
-    };
-    let mut history = AccelHistory::new(
-        diis_depth(
-            nao,
-            if keep_densities { 3 } else { 2 },
-            options.scf_memory_mb,
-        ),
-        keep_densities,
-    );
+    let mut accel = Accelerator::new(nao, accel, options.adiis_switch, options.scf_memory_mb);
 
     for iter in 0..options.max_scf {
         iterations = iter + 1;
@@ -753,26 +636,7 @@ fn rhf_loop(
         let e_elec = 0.5 * (density.frobenius_dot(&core.h_core) + density.frobenius_dot(&f));
 
         let t_a = std::time::Instant::now();
-        let f_use = match accel {
-            ScfAccelerator::None => f,
-            _ => {
-                let err = commutator(&f, &density);
-                // History (Fock, commutator, density) for CDIIS / A-DIIS; the
-                // Gram update returns [F,P]2 so it is not evaluated twice.
-                let err_norm = history
-                    .push(f, err, keep_densities.then(|| density.clone()))
-                    .sqrt();
-                let extrapolated =
-                    if accel == ScfAccelerator::AdiisCdiis && err_norm > options.adiis_switch {
-                        history.adiis()
-                    } else {
-                        history.cdiis()
-                    };
-                // No usable extrapolation (a singular Gram matrix, or a
-                // single-entry history): fall back to the newest plain Fock.
-                extrapolated.unwrap_or_else(|| history.focks[history.len() - 1].clone())
-            }
-        };
+        let f_use = accel.step(f, &density);
         let t1 = std::time::Instant::now();
         if timing {
             t_accel += t_a.elapsed().as_secs_f64();
@@ -806,7 +670,7 @@ fn rhf_loop(
     if timing {
         eprintln!(
             "[timing]   RHF fock: {t_fock:.3}s  accel: {t_accel:.3}s  eigen: {t_eigen:.3}s  density: {t_density:.3}s  ({iterations} iters, diis depth {})",
-            history.depth
+            accel.depth()
         );
     }
     let f_final = build_fock(molecule, basis, params, core, &density)?;
@@ -818,7 +682,10 @@ fn rhf_loop(
         spin_density: None,
         mo_energies,
         mo_coeff,
+        mo_energies_beta: None,
+        mo_coeff_beta: None,
         n_occ,
+        n_beta: n_occ,
         electronic_ev,
         converged,
         iterations,
@@ -835,6 +702,7 @@ fn uhf_loop(
     n_alpha: usize,
     n_beta: usize,
     options: &NddoOptions,
+    start: (Matrix, Matrix),
 ) -> Result<ScfState> {
     let nao = basis.nao;
     // Transition-metal d AOs to penalize during annealing (open-shell d collapse fix).
@@ -851,29 +719,37 @@ fn uhf_loop(
     } else {
         Vec::new()
     };
-    // SAD guess split by spin population; the different / aufbau counts break spin symmetry.
-    // Use a common core-Hamiltonian orbital guess. Unequal occupations break
-    // spin symmetry without fractionally removing charge from every atom, as
-    // a globally scaled SAD guess would do for radicals.
-    let (_, guess_coefficients) = symmetric_eigen(&core.h_core)?;
-    let mut pa = density_from_coeff(&guess_coefficients, n_alpha, 1.0);
-    let mut pb = density_from_coeff(&guess_coefficients, n_beta, 1.0);
+    // The starting densities come from the caller, which runs this loop once per
+    // candidate start and keeps the lowest solution. The spin split itself puts
+    // the excess spin where each AO has room for it rather than in proportion to
+    // how occupied it already is; both are `scf_accel`'s business.
+    let (mut pa, mut pb) = start;
     let mut e_old = 0.0;
     let mut eps_a = vec![0.0; nao];
     let mut c_a = Matrix::zeros(nao, nao);
+    let mut eps_b = vec![0.0; nao];
+    let mut c_b = Matrix::zeros(nao, nao);
     let mut converged = false;
     let mut iterations = 0;
 
-    let mut hist_fa: Vec<Matrix> = Vec::new();
-    let mut hist_fb: Vec<Matrix> = Vec::new();
-    let mut hist_err: Vec<Matrix> = Vec::new();
-    // One slot holds F_, F_ and the stacked 2nao  nao error matrix.
-    let max_diis = diis_depth(nao, 4, options.scf_memory_mb);
-    // The RHF A-DIIS implementation extrapolates one density/Fock pair.  It
-    // cannot be reused for UHF without a spin-resolved energy functional.
-    // Plain UHF iterations are robust from the SAD spin guess; only an
-    // explicitly requested CDIIS mode uses the paired-Fock extrapolator.
-    let use_cdiis = options.use_diis && options.accelerator == ScfAccelerator::Cdiis;
+    // Same helium caveat as the RHF path: MOPAC's MNDO He parameterization has
+    // formal p AOs but an s-only core attraction, and an extrapolated path can
+    // land on a different charge-transfer fixed point.
+    let contains_helium = molecule.atoms.iter().any(|atom| atom.z == 2);
+    let accel_mode = if options.use_diis && !contains_helium {
+        options.accelerator
+    } else {
+        ScfAccelerator::None
+    };
+    // One accelerator for both channels, extrapolating the stacked pair with a
+    // single set of coefficients. A previous comment here claimed A-DIIS could
+    // not be reused for UHF "without a spin-resolved energy functional", and so
+    // left UHF unaccelerated unless the caller asked for plain CDIIS by name.
+    // That is not so: the Frobenius product of the stacked matrices is
+    // `Tr[P_a F_a] + Tr[P_b F_b]`, which *is* the UHF pairing, so the A-DIIS
+    // functional is correct on the stack with no change.
+    let mut accel =
+        Accelerator::new_uhf(nao, accel_mode, options.adiis_switch, options.scf_memory_mb);
 
     for iter in 0..options.max_scf {
         iterations = iter + 1;
@@ -887,33 +763,7 @@ fn uhf_loop(
         let e_elec = 0.5
             * (p_tot.frobenius_dot(&core.h_core) + pa.frobenius_dot(&fa) + pb.frobenius_dot(&fb));
 
-        // Combined DIIS error = [F_a,P_a]  [F_b,P_b].
-        let ea = commutator(&fa, &pa);
-        let eb = commutator(&fb, &pb);
-        let mut err = Matrix::zeros(2 * nao, nao);
-        for i in 0..nao {
-            for j in 0..nao {
-                err[(i, j)] = ea[(i, j)];
-                err[(nao + i, j)] = eb[(i, j)];
-            }
-        }
-        let (fa_use, fb_use) = if use_cdiis {
-            hist_fa.push(fa.clone());
-            hist_fb.push(fb.clone());
-            hist_err.push(err);
-            if hist_fa.len() > max_diis {
-                hist_fa.remove(0);
-                hist_fb.remove(0);
-                hist_err.remove(0);
-            }
-            match diis_coeffs(&hist_err) {
-                Some(coeffs) => (combine(&hist_fa, &coeffs), combine(&hist_fb, &coeffs)),
-                None => (fa, fb),
-            }
-        } else {
-            (fa, fb)
-        };
-
+        let (fa_use, fb_use) = accel.step_uhf(fa, fb, &pa, &pb);
         // Level shift (path only; the converged fixed point is unchanged).
         let shift = options.level_shift_ev;
         let mut fa_diag = level_shift(&fa_use, &pa, shift);
@@ -931,7 +781,7 @@ fn uhf_loop(
             }
         }
         let (ea_eps, ca) = symmetric_eigen(&fa_diag)?;
-        let (_eb_eps, cb) = symmetric_eigen(&fb_diag)?;
+        let (eb_eps, cb) = symmetric_eigen(&fb_diag)?;
         let mut pa_new = density_from_coeff(&ca, n_alpha, 1.0);
         let mut pb_new = density_from_coeff(&cb, n_beta, 1.0);
 
@@ -949,6 +799,8 @@ fn uhf_loop(
         let de = (e_elec - e_old).abs();
         eps_a = ea_eps;
         c_a = ca;
+        eps_b = eb_eps;
+        c_b = cb;
         pa = pa_new;
         pb = pb_new;
         e_old = e_elec;
@@ -981,195 +833,18 @@ fn uhf_loop(
         spin_density: Some(spin),
         mo_energies: eps_a,
         mo_coeff: c_a,
+        // Kept rather than dropped: the beta eigenvalues are what make the
+        // reported LUMO the lowest unoccupied orbital rather than the lowest
+        // unoccupied *alpha* orbital, which for a doublet is a different one.
+        mo_energies_beta: Some(eps_b),
+        mo_coeff_beta: Some(c_b),
         n_occ: n_alpha,
+        n_beta,
         electronic_ev,
         converged,
         iterations,
         unrestricted: true,
     })
-}
-
-/// Linear combination ` c_i F_i` of the history, chunked over rayon: the
-/// history is up to 8 matrices of `nao2` doubles, so this is a pure
-/// memory-bandwidth pass that is worth splitting for large bases.
-fn combine(fs: &[Matrix], coeffs: &[f64]) -> Matrix {
-    use rayon::prelude::*;
-    let (r, c) = (fs[0].rows, fs[0].cols);
-    let mut out = Matrix::zeros(r, c);
-    let n = r * c;
-    if n < (1 << 18) {
-        for (i, f) in fs.iter().enumerate() {
-            let ci = coeffs[i];
-            for (o, v) in out.as_mut_slice().iter_mut().zip(f.as_slice()) {
-                *o += ci * v;
-            }
-        }
-        return out;
-    }
-    const CHUNK: usize = 1 << 16;
-    out.as_mut_slice()
-        .par_chunks_mut(CHUNK)
-        .enumerate()
-        .for_each(|(k, dst)| {
-            let lo = k * CHUNK;
-            for (i, f) in fs.iter().enumerate() {
-                let ci = coeffs[i];
-                let src = &f.as_slice()[lo..lo + dst.len()];
-                for (o, v) in dst.iter_mut().zip(src) {
-                    *o += ci * v;
-                }
-            }
-        });
-    out
-}
-
-/// Solve the Pulay DIIS coefficient system from a stack of error matrices.
-/// Convenience wrapper that forms the `E_i,E_j` Gram matrix from scratch;
-/// the RHF path maintains it incrementally instead ([`AccelHistory`]).
-fn diis_coeffs(es: &[Matrix]) -> Option<Vec<f64>> {
-    let gram: Vec<Vec<f64>> = es
-        .iter()
-        .map(|ei| es.iter().map(|ej| ei.frobenius_dot(ej)).collect())
-        .collect();
-    diis_coeffs_from_gram(&gram)
-}
-
-/// Solve the Pulay DIIS coefficient system from a precomputed `E_i,E_j` Gram matrix.
-fn diis_coeffs_from_gram(gram: &[Vec<f64>]) -> Option<Vec<f64>> {
-    let n = gram.len();
-    if n < 2 {
-        return None;
-    }
-    let dim = n + 1;
-    let mut b = Matrix::zeros(dim, dim);
-    for i in 0..n {
-        for j in 0..n {
-            b[(i, j)] = gram[i][j];
-        }
-        b[(i, n)] = -1.0;
-        b[(n, i)] = -1.0;
-    }
-    let mut rhs = vec![0.0; dim];
-    rhs[n] = -1.0;
-    // The DIIS matrix (a small bordered saddle-point system) becomes singular near
-    // convergence when the error vectors turn linearly dependent. A pivot-guarded
-    // Gaussian elimination returns `None` there so the caller falls back to the plain
-    // Fock  faer's LU instead returns a degenerate solution that derails DIIS. The heavy
-    // O(n^3) eigendecomposition still uses faer; only this tiny solve is bespoke.
-    solve_bordered_small(&b, &rhs)
-}
-
-/// Gaussian elimination with partial pivoting for the small DIIS system; returns `None`
-/// if the matrix is (near-)singular.
-fn solve_bordered_small(a: &Matrix, b: &[f64]) -> Option<Vec<f64>> {
-    let n = a.rows;
-    let mut m = a.clone();
-    let mut rhs = b.to_vec();
-    for col in 0..n {
-        let mut pivot = col;
-        let mut best = m[(col, col)].abs();
-        for row in (col + 1)..n {
-            let v = m[(row, col)].abs();
-            if v > best {
-                best = v;
-                pivot = row;
-            }
-        }
-        if best < 1.0e-12 {
-            return None;
-        }
-        if pivot != col {
-            for j in 0..n {
-                let t = m[(col, j)];
-                m[(col, j)] = m[(pivot, j)];
-                m[(pivot, j)] = t;
-            }
-            rhs.swap(col, pivot);
-        }
-        for row in (col + 1)..n {
-            let factor = m[(row, col)] / m[(col, col)];
-            if factor == 0.0 {
-                continue;
-            }
-            for j in col..n {
-                let v = m[(col, j)];
-                m[(row, j)] -= factor * v;
-            }
-            rhs[row] -= factor * rhs[col];
-        }
-    }
-    let mut x = vec![0.0; n];
-    for col in (0..n).rev() {
-        let mut sum = rhs[col];
-        for j in (col + 1)..n {
-            sum -= m[(col, j)] * x[j];
-        }
-        x[col] = sum / m[(col, col)];
-    }
-    Some(x)
-}
-
-/// Projected-gradient minimization of the A-DIIS quadratic
-/// `f(c) = 2  c_i D_iD_n|F_n +  c_i c_j D_iD_n|F_jF_n`
-/// (Hu & Yang 2010) on the probability simplex `{c  0, c = 1}`. The
-/// nonnegative weights prevent the runaway extrapolation plain DIIS can produce
-/// far from convergence.
-fn solve_adiis_simplex(d: &[f64], s: &[Vec<f64>]) -> Vec<f64> {
-    let n = d.len();
-    // Lipschitz estimate for the step size from (S + ST).
-    let mut l: f64 = 1.0e-12;
-    for (i, s_i) in s.iter().enumerate().take(n) {
-        let mut row = 0.0;
-        for (j, &s_ij) in s_i.iter().enumerate().take(n) {
-            row += (s_ij + s[j][i]).abs();
-        }
-        l = l.max(row);
-    }
-    let lr = 1.0 / l;
-    // Start from the latest point (all weight on the newest Fock/density).
-    let mut c = vec![0.0; n];
-    c[n - 1] = 1.0;
-    for _ in 0..400 {
-        // grad_k = 2 d_k + _j (s_kj + s_jk) c_j
-        let mut g = vec![0.0; n];
-        for k in 0..n {
-            let mut acc = 2.0 * d[k];
-            for j in 0..n {
-                acc += (s[k][j] + s[j][k]) * c[j];
-            }
-            g[k] = acc;
-        }
-        let trial: Vec<f64> = (0..n).map(|i| c[i] - lr * g[i]).collect();
-        let proj = simplex_project(&trial);
-        let mut delta = 0.0;
-        for i in 0..n {
-            delta += (proj[i] - c[i]).abs();
-        }
-        c = proj;
-        if delta < 1.0e-12 {
-            break;
-        }
-    }
-    c
-}
-
-/// Euclidean projection of `v` onto the probability simplex `{c  0, c = 1}`.
-fn simplex_project(v: &[f64]) -> Vec<f64> {
-    let mut u = v.to_vec();
-    u.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let mut css = 0.0;
-    let mut rho = 0;
-    let mut theta = 0.0;
-    for (j, &uj) in u.iter().enumerate() {
-        css += uj;
-        let t = (css - 1.0) / (j as f64 + 1.0);
-        if uj - t > 0.0 {
-            rho = j + 1;
-            theta = t;
-        }
-    }
-    let _ = rho;
-    v.iter().map(|&vi| (vi - theta).max(0.0)).collect()
 }
 
 #[cfg(test)]
@@ -1191,22 +866,6 @@ mod tests {
             ..NddoOptions::default()
         };
         run_nddo_with_parameters(&mol, &params, &opts).unwrap()
-    }
-
-    #[test]
-    fn diis_depth_respects_the_memory_budget() {
-        // Unlimited budget keeps the full depth.
-        assert_eq!(diis_depth(1800, 3, 0), MAX_DIIS_DEPTH);
-        // 512 MiB / (3  18002  8 B = 74.2 MiB) = 6 slots.
-        assert_eq!(diis_depth(1800, 3, 512), 6);
-        // A huge basis is floored at 2 rather than 0.
-        assert_eq!(diis_depth(8000, 3, 512), 2);
-        // ...and at that size a depth-2 A-DIIS history does not fit, so the
-        // caller degrades to CDIIS instead of blowing the budget.
-        assert!(!diis_depth_fits(8000, 3, 512));
-        assert!(diis_depth_fits(1800, 3, 512));
-        // A small system is unaffected.
-        assert_eq!(diis_depth(60, 3, 512), MAX_DIIS_DEPTH);
     }
 
     #[test]

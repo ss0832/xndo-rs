@@ -199,11 +199,22 @@ fn near_degenerate_planar_methyl_state_derivatives_are_explicit() {
     .unwrap()
     .with_multiplicity(2);
     let params = ZindoParameters::cached().unwrap();
-    let options = ucis_options();
-    assert!(!zindo_s_ucis(&mol, params, &options)
-        .unwrap()
-        .states
-        .is_empty());
+    // D3h planar methyl has genuinely degenerate E' excited states, but they are
+    // not the lowest root: the lowest is the non-degenerate 4->5 excitation at
+    // ~6.10 eV, and the first degenerate pair sits ~3.1 eV above it at ~9.176 eV,
+    // split by ~2e-5 eV. Requesting a single root therefore cannot exercise the
+    // isolation guard at all, so ask for the pair.
+    let options = ZindoOptions {
+        n_states: 3,
+        ..ucis_options()
+    };
+    let spectrum = zindo_s_ucis(&mol, params, &options).unwrap();
+    assert!(spectrum.states.len() >= 3);
+    let split = (spectrum.states[2].energy_ev - spectrum.states[1].energy_ev).abs();
+    assert!(
+        split < 1.0e-4,
+        "expected a degenerate E' pair among the requested roots, got a {split:e} eV split"
+    );
     let gradient_error = zindo_s_ucis_gradients(&mol, params, &options).unwrap_err();
     assert!(gradient_error.to_string().contains("not unique"));
     let hessian_error = zindo_s_ucis_hessians(&mol, params, &options).unwrap_err();

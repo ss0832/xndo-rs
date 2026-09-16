@@ -7,8 +7,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use xndo_rs::constants::ANGSTROM_TO_BOHR;
+use xndo_rs::molden::{write_molden, MoldenCoefficients};
 use xndo_rs::{
-    analytic_hessian, optimize, run_cndo_indo, run_gradient, run_hessian, run_mindo3,
+    analytic_hessian, optimize, run_cndo_indo, run_gradient, run_hessian, run_method, run_mindo3,
     run_nddo_with_parameters, run_zindo_s, vibrational_analysis, vibrational_analysis_from_hessian,
     zindo_s_cis_gradients, zindo_s_cis_hessians, zindo_s_cis_spin, zindo_s_ucis,
     zindo_s_ucis_gradients, zindo_s_ucis_hessians, CisSpin, CndoIndoOptions, Method, Mindo3Options,
@@ -18,7 +19,8 @@ use xndo_rs::{
 fn cli_usage() -> &'static str {
     r#"Usage:
   xndo_rs_cli methods
-  xndo_rs_cli <energy|gradient|charges|optimize|frequencies|hessian|uv-vis|spectrum|excited-properties|excited-gradient|excited-hessian> file.xyz [options]
+  xndo_rs_cli licenses [filter]
+  xndo_rs_cli <energy|gradient|charges|orbitals|molden|optimize|frequencies|hessian|uv-vis|spectrum|excited-properties|excited-gradient|excited-hessian> file.xyz [options]
 
 Options:
   --method <name>                 Method (default: mndo)
@@ -28,6 +30,16 @@ Options:
   --states <n>                    Number of ZINDO/S CIS roots per spin sector (default: 10)
   --state-type <singlet|triplet|both>
                                   ZINDO/S CIS spin sector (default: singlet)
+  --licenses [filter]             Print the attribution documents and exit.
+                                  With a filter, print only matching ones,
+                                  e.g. `--licenses MPL`.
+  --molden <path>                 Also write a Molden wavefunction file.
+  --molden-coefficients <lowdin|raw>
+                                  lowdin (default) back-transforms with
+                                  S^(-1/2) so the orbitals are orthonormal over
+                                  the Gaussians in the file; raw writes the
+                                  engine's coefficients unchanged, which they
+                                  are not.
   --no-diis                       Disable MNDO/MNDO-d DIIS
   --opt-max-iter <n>              Optimization iteration limit (default: 200)
   --opt-gtol <x>                  Max-gradient convergence in eV/Bohr (default: 1e-3)
@@ -41,6 +53,13 @@ Executable method strings by API:
     MNDO/d   : mndod | mndo/d | mndo-d
     MINDO/3  : mindo3 | mindo/3 | mindo
     ZINDO/S  : zindo/s | zindos | zindo | indo/s | indos
+
+  molden (wavefunction file; s/p everywhere, d for MNDO/d):
+    All six native ground-state methods listed above, except that ZINDO/S
+    rejects elements needing its unimplemented d branch.
+
+  orbitals (orbital energies, occupations, HOMO/LUMO and the gap):
+    All six native ground-state methods listed above.
 
   gradient, hessian, frequencies:
     CNDO/2   : cndo2 | cndo/2 | cndo
@@ -83,6 +102,8 @@ struct Cli {
     opt_max_iter: usize,
     opt_gtol: f64,
     opt_history: usize,
+    molden: Option<String>,
+    molden_raw: bool,
 }
 
 fn parse_reference(value: &str) -> Result<Reference, String> {
@@ -99,6 +120,14 @@ fn parse_reference(value: &str) -> Result<Reference, String> {
 fn parse_args() -> Result<Cli, String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(|| cli_usage().to_owned())?;
+    if command == "licenses" || command == "--licenses" {
+        // Handled here rather than in the option loop below, which takes the
+        // next token as every flag's value: a bare `--licenses` there would
+        // swallow the following argument, or fail for want of one. Same shape
+        // as the `--no-diis` special case.
+        xndo_rs::print_licenses(args.next().as_deref());
+        std::process::exit(0);
+    }
     if command == "--help" || command == "-h" {
         return Err(String::new());
     }
@@ -116,6 +145,8 @@ fn parse_args() -> Result<Cli, String> {
             opt_max_iter: 200,
             opt_gtol: 1.0e-3,
             opt_history: 8,
+            molden: None,
+            molden_raw: false,
         });
     }
     let path = args
@@ -134,6 +165,8 @@ fn parse_args() -> Result<Cli, String> {
         opt_max_iter: 200,
         opt_gtol: 1.0e-3,
         opt_history: 8,
+        molden: None,
+        molden_raw: false,
     };
     while let Some(flag) = args.next() {
         if flag == "--no-diis" {
@@ -168,6 +201,18 @@ fn parse_args() -> Result<Cli, String> {
                     .map_err(|_| format!("invalid state count: {value}"))?
             }
             "--reference" => cli.reference = parse_reference(&value)?,
+            "--molden" => cli.molden = Some(value),
+            "--molden-coefficients" => {
+                cli.molden_raw = match value.trim().to_ascii_lowercase().as_str() {
+                    "lowdin" => false,
+                    "raw" | "raw-zdo" => true,
+                    other => {
+                        return Err(format!(
+                            "--molden-coefficients must be lowdin or raw (got {other:?})"
+                        ))
+                    }
+                };
+            }
             "--opt-max-iter" => {
                 cli.opt_max_iter = value
                     .parse()
@@ -205,8 +250,9 @@ fn parse_args() -> Result<Cli, String> {
         }
     }
     match cli.command.as_str() {
-        "energy" | "gradient" | "charges" | "optimize" | "frequencies" | "hessian" | "uv-vis"
-        | "spectrum" | "excited-properties" | "excited-gradient" | "excited-hessian" => {}
+        "energy" | "gradient" | "charges" | "orbitals" | "molden" | "optimize" | "frequencies"
+        | "hessian" | "uv-vis" | "spectrum" | "excited-properties" | "excited-gradient"
+        | "excited-hessian" => {}
         _ => {
             return Err(format!(
                 "unknown command: {}\n\n{}",
@@ -400,6 +446,108 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // `--molden PATH` is honoured alongside whatever else was asked for, and
+    // `molden` on its own is the command that does only this. Both go through
+    // the same path so the file cannot differ between them.
+    let molden_target = if cli.command == "molden" {
+        Some(cli.molden.clone().unwrap_or_else(|| {
+            let stem = Path::new(cli.path.as_deref().unwrap_or("out"))
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("out");
+            format!("{stem}.molden")
+        }))
+    } else {
+        cli.molden.clone()
+    };
+    if let Some(target) = &molden_target {
+        let mode = if cli.molden_raw {
+            MoldenCoefficients::RawZdo
+        } else {
+            MoldenCoefficients::LowdinBackTransformed
+        };
+        write_molden(
+            Path::new(target),
+            &molecule,
+            cli.method,
+            &nddo_options(&cli),
+            mode,
+        )?;
+        println!("Molden file: {target}");
+        if cli.molden_raw {
+            println!(
+                "  WARNING: raw ZDO coefficients; the orbitals in this file are not\n  \
+                 orthonormal over its own basis, so its density does not integrate\n  \
+                 to the electron count."
+            );
+        }
+        if cli.command == "molden" {
+            return Ok(());
+        }
+    }
+
+    if cli.command == "orbitals" {
+        // Handled here, ahead of the per-method dispatch below, because the
+        // orbital block is the one output that is identical for all six
+        // methods; `CalculationResult::orbitals()` is what makes that true.
+        let result = run_method(&molecule, cli.method, &nddo_options(&cli))?;
+        let o = result.orbitals();
+        let fmt = |v: Option<f64>| match v {
+            Some(x) => format!("{x:.10} eV"),
+            // A full or empty shell has no such orbital; printing a number
+            // would be an invention.
+            None => "n/a".to_string(),
+        };
+        println!("Method:                {}", cli.method);
+        println!(
+            "Reference:             {}",
+            if o.unrestricted_reference() {
+                "UHF"
+            } else {
+                "RHF"
+            }
+        );
+        println!("Energy:                {:.12} eV", result.total_ev());
+        println!("Occupied (alpha/beta): {} / {}", o.n_alpha, o.n_beta);
+        println!("HOMO:                  {}", fmt(o.homo_ev()));
+        println!("LUMO:                  {}", fmt(o.lumo_ev()));
+        println!("HOMO-LUMO gap:         {}", fmt(o.gap_ev()));
+        if o.unrestricted_reference() {
+            // Alpha and beta eigenvalues come from different Fock operators, so
+            // the pair above is over spin orbitals, not one orbital diagram.
+            println!(
+                "  alpha HOMO/LUMO:     {} / {}",
+                fmt(o.homo_alpha_ev()),
+                fmt(o.lumo_alpha_ev())
+            );
+            println!(
+                "  beta  HOMO/LUMO:     {} / {}",
+                fmt(o.homo_beta_ev()),
+                fmt(o.lumo_beta_ev())
+            );
+        }
+        let occ_a = o.occupations_alpha();
+        let occ_b = o.occupations_beta();
+        match &occ_b {
+            Some(_) => println!("#   mo      alpha (eV)  occ        beta (eV)  occ"),
+            None => println!("#   mo   energy (eV)  occ"),
+        }
+        for (i, e) in o.alpha_ev.iter().enumerate() {
+            match (&o.beta_ev, &occ_b) {
+                (Some(beta), Some(ob)) => println!(
+                    "{:>6} {:>15.10} {:>4.1} {:>16.10} {:>4.1}",
+                    i + 1,
+                    e,
+                    occ_a[i],
+                    beta[i],
+                    ob[i]
+                ),
+                _ => println!("{:>6} {:>15.10} {:>4.1}", i + 1, e, occ_a[i]),
+            }
+        }
+        return Ok(());
+    }
+
     if cli.command == "gradient" {
         let result = run_gradient(&molecule, cli.method, &nddo_options(&cli))?;
         println!("Method:                {}", cli.method);
@@ -461,6 +609,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("Electronic energy:     {:.12} eV", r.electronic_ev);
                     println!("Core-core energy:      {:.12} eV", r.core_ev);
                     println!("SCF iterations:        {}", r.iterations);
+                    println!("MO energies (eV):      {:?}", r.mo_energies_ev);
+                    if let Some(beta) = &r.mo_energies_beta_ev {
+                        println!("Beta MO energies (eV): {beta:?}");
+                    }
+                    println!(
+                        "Dipole: {:.8} {:.8} {:.8} D; |mu|={:.8} D",
+                        r.dipole_debye[0],
+                        r.dipole_debye[1],
+                        r.dipole_debye[2],
+                        r.dipole_magnitude_debye
+                    );
                     if cli.command == "charges" {
                         println!("# atom  element    INDO population charge (e)");
                         for (i, (atom, q)) in molecule.atoms.iter().zip(&r.charges).enumerate() {
@@ -557,6 +716,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(beta) = &r.mo_energies_beta_ev {
                     println!("Beta MO energies (eV): {:?}", beta);
                 }
+                println!(
+                    "Dipole: {:.8} {:.8} {:.8} D; |mu|={:.8} D",
+                    r.dipole_debye[0],
+                    r.dipole_debye[1],
+                    r.dipole_debye[2],
+                    r.dipole_magnitude_debye
+                );
                 if cli.command == "charges" {
                     println!("# atom  element    NDO population charge (e)");
                     for (i, (atom, q)) in molecule.atoms.iter().zip(&r.charges).enumerate() {
@@ -600,6 +766,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     r.heat_of_formation_kcal
                 );
                 println!("SCF iterations:        {}", r.iterations);
+                println!("MO energies (eV):      {:?}", r.mo_energies_ev);
+                if let Some(beta) = &r.mo_energies_beta_ev {
+                    println!("Beta MO energies (eV): {beta:?}");
+                }
                 if cli.command == "charges" {
                     println!("# atom  element    population charge (e)");
                     for (i, (atom, q)) in molecule.atoms.iter().zip(&r.charges).enumerate() {

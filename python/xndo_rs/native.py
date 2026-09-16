@@ -40,6 +40,61 @@ def single_point(numbers: Sequence[int], positions, charge: float = 0.0,
                                 str(reference), str(method))
 
 
+def orbital_energies(numbers: Sequence[int], positions, charge: float = 0.0,
+                     multiplicity: int = 1, reference: str = "auto",
+                     method: str = "mndo") -> dict:
+    """Orbital energies, occupations and the frontier pair, in eV.
+
+    ``mo_energies_ev`` and ``occupations`` are the restricted spectrum, or the
+    alpha one when the reference is unrestricted. ``mo_energies_beta_ev`` and
+    ``occupations_beta`` are the beta spectrum, and are ``None`` for a restricted
+    reference. Also present: ``n_occ``, ``n_alpha``, ``n_beta``,
+    ``homo_lumo_gap_ev``, and the per-channel ``homo_alpha_ev``,
+    ``lumo_alpha_ev``, ``homo_beta_ev``, ``lumo_beta_ev``.
+
+    ``homo_ev`` and ``lumo_ev`` are taken over *both* spin channels, so for an
+    open-shell doublet the LUMO is usually the beta partner of the singly
+    occupied orbital rather than the lowest unoccupied alpha orbital. The two
+    channels are eigenvalues of different Fock operators, so neither spectrum
+    alone gives the frontier pair. Use ``lumo_alpha_ev`` for the alpha diagram
+    on its own. A frontier orbital that does not exist is ``None``.
+    """
+    n, p = _as_lists(numbers, positions)
+    return _native.orbital_energies(n, p, float(charge), int(multiplicity),
+                                    str(reference), str(method))
+
+
+def molden(numbers: Sequence[int], positions, charge: float = 0.0,
+           multiplicity: int = 1, reference: str = "auto",
+           method: str = "mndo", coefficients: str = "lowdin") -> str:
+    """A Molden wavefunction file, as a string.
+
+    The MO coefficients are back-transformed with ``S^(-1/2)`` so that they are
+    orthonormal over the Gaussians written in the file. Every engine here assumes
+    an orthonormal AO basis, while a Molden file describes real Gaussians, which
+    are not orthonormal; a reader handed the raw coefficients would compute a
+    density that does not integrate to the electron count. Pass
+    ``coefficients="raw"`` for the untransformed coefficients, to compare against
+    programs that make that identification -- such a file says so in its title.
+
+    The Slater basis is expanded as STO-6G (Stewart, *J. Chem. Phys.* **52**, 431
+    (1970)), and d shells are written in Molden's ``[5D]`` order.
+    """
+    n, p = _as_lists(numbers, positions)
+    return _native.molden(n, p, float(charge), int(multiplicity), str(reference),
+                          str(method), str(coefficients))
+
+
+def third_party_licenses() -> list[dict]:
+    """The third-party licence and attribution documents this build embeds.
+
+    One dict per document, with ``path``, ``role`` and the verbatim ``text``.
+    These are the notices Apache-2.0 4(c) and GPL-3.0 5(a) require to be carried,
+    so they travel with the installed wheel and not only with the source tree.
+    """
+    return _native.third_party_licenses()
+
+
 def gradient(numbers: Sequence[int], positions, charge: float = 0.0,
              multiplicity: int = 1, reference: str = "auto",
              method: str = "mndo") -> dict:

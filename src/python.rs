@@ -12,11 +12,13 @@ use crate::constants::{ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM, EV_TO_HARTREE};
 use crate::data_tables;
 use crate::method::Method;
 use crate::mindo3::{run_mindo3, Mindo3Options};
+use crate::molden::{molden_string, MoldenCoefficients};
 use crate::optimizer::{optimize as opt_geom, OptOptions};
+use crate::orbitals::OrbitalEnergies;
 use crate::params::NddoParameters;
 use crate::scf::{run_nddo_with_parameters, NddoOptions, Reference};
 use crate::system::{Atom, Molecule};
-use crate::xndo::{run_gradient, run_hessian};
+use crate::xndo::{run_gradient, run_hessian, run_method};
 use crate::zindo::{
     run_zindo_s, zindo_s_cis_gradients, zindo_s_cis_hessians, zindo_s_cis_spin, zindo_s_ucis,
     zindo_s_ucis_gradients, zindo_s_ucis_hessians, CisSpin, ZindoOptions, ZindoParameters,
@@ -107,6 +109,33 @@ fn matrix_rows(m: &crate::linalg::Matrix) -> Vec<Vec<f64>> {
         .collect()
 }
 
+/// Write the orbital block into a result dict.
+///
+/// Every engine's `single_point` dict carries the same keys, so a caller does
+/// not have to know which one ran. `homo_ev` / `lumo_ev` are the frontier pair
+/// over *both* spin channels; the per-channel values are there too, because for
+/// an unrestricted reference the two channels come from different Fock
+/// operators and a caller may legitimately want one diagram rather than the
+/// combined pair. A frontier orbital that does not exist (a full or empty
+/// shell) is `None`, never a substituted number.
+fn set_orbital_items(d: &Bound<'_, PyDict>, o: &OrbitalEnergies) -> PyResult<()> {
+    d.set_item("mo_energies_ev", o.alpha_ev.clone())?;
+    d.set_item("mo_energies_beta_ev", o.beta_ev.clone())?;
+    d.set_item("n_occ", o.n_alpha)?;
+    d.set_item("n_alpha", o.n_alpha)?;
+    d.set_item("n_beta", o.n_beta)?;
+    d.set_item("homo_ev", o.homo_ev())?;
+    d.set_item("lumo_ev", o.lumo_ev())?;
+    d.set_item("homo_lumo_gap_ev", o.gap_ev())?;
+    d.set_item("homo_alpha_ev", o.homo_alpha_ev())?;
+    d.set_item("lumo_alpha_ev", o.lumo_alpha_ev())?;
+    d.set_item("homo_beta_ev", o.homo_beta_ev())?;
+    d.set_item("lumo_beta_ev", o.lumo_beta_ev())?;
+    d.set_item("occupations", o.occupations_alpha())?;
+    d.set_item("occupations_beta", o.occupations_beta())?;
+    Ok(())
+}
+
 fn parse_cis_spins(state_type: &str) -> PyResult<Vec<CisSpin>> {
     match state_type.trim().to_ascii_lowercase().as_str() {
         "singlet" => Ok(vec![CisSpin::Singlet]),
@@ -146,12 +175,12 @@ fn single_point(
             d.set_item("energy_ev", r.total_ev)?;
             d.set_item("electronic_ev", r.electronic_ev)?;
             d.set_item("core_ev", r.core_ev)?;
-            d.set_item("charges", r.charges)?;
-            d.set_item("mo_energies_ev", r.mo_energies_ev)?;
-            d.set_item("mo_energies_beta_ev", r.mo_energies_beta_ev)?;
-            d.set_item("n_occ", r.n_occ)?;
-            d.set_item("n_alpha", r.n_alpha)?;
-            d.set_item("n_beta", r.n_beta)?;
+            d.set_item("charges", r.charges.clone())?;
+            d.set_item(
+                "dipole_debye",
+                [r.dipole_debye[0], r.dipole_debye[1], r.dipole_debye[2]],
+            )?;
+            set_orbital_items(&d, &r.orbitals())?;
             d.set_item("unrestricted", r.unrestricted)?;
             if let Some(sd) = &r.spin_density {
                 d.set_item("spin_density", matrix_rows(sd))?;
@@ -175,13 +204,13 @@ fn single_point(
             d.set_item("heat_of_formation_kcal", r.heat_of_formation_kcal)?;
             d.set_item("electronic_ev", r.electronic_ev)?;
             d.set_item("core_ev", r.core_ev)?;
-            d.set_item("charges", r.charges)?;
+            d.set_item("charges", r.charges.clone())?;
             d.set_item(
                 "dipole_debye",
                 [r.dipole_debye.x, r.dipole_debye.y, r.dipole_debye.z],
             )?;
-            d.set_item("homo_ev", r.homo_ev)?;
-            d.set_item("lumo_ev", r.lumo_ev)?;
+            set_orbital_items(&d, &r.orbitals())?;
+            d.set_item("iterations", r.iterations)?;
             d.set_item("converged", r.converged)?;
             d.set_item("unrestricted", r.unrestricted)?;
             if let Some(sd) = &r.spin_density {
@@ -204,12 +233,8 @@ fn single_point(
             d.set_item("heat_of_formation_kcal", r.heat_of_formation_kcal)?;
             d.set_item("electronic_ev", r.electronic_ev)?;
             d.set_item("core_ev", r.core_ev)?;
-            d.set_item("charges", r.charges)?;
-            d.set_item("mo_energies_ev", r.mo_energies_ev)?;
-            d.set_item("mo_energies_beta_ev", r.mo_energies_beta_ev)?;
-            d.set_item("n_occ", r.n_occ)?;
-            d.set_item("n_alpha", r.n_alpha)?;
-            d.set_item("n_beta", r.n_beta)?;
+            d.set_item("charges", r.charges.clone())?;
+            set_orbital_items(&d, &r.orbitals())?;
             d.set_item("unrestricted", r.unrestricted)?;
             if let Some(sd) = &r.spin_density {
                 d.set_item("spin_density", matrix_rows(sd))?;
@@ -233,12 +258,12 @@ fn single_point(
             d.set_item("energy_ev", r.total_ev)?;
             d.set_item("electronic_ev", r.electronic_ev)?;
             d.set_item("core_ev", r.core_ev)?;
-            d.set_item("charges", r.charges)?;
-            d.set_item("mo_energies_ev", r.mo_energies_ev)?;
-            d.set_item("mo_energies_beta_ev", r.mo_energies_beta_ev)?;
-            d.set_item("n_occ", r.n_occ)?;
-            d.set_item("n_alpha", r.n_alpha)?;
-            d.set_item("n_beta", r.n_beta)?;
+            d.set_item("charges", r.charges.clone())?;
+            d.set_item(
+                "dipole_debye",
+                [r.dipole_debye[0], r.dipole_debye[1], r.dipole_debye[2]],
+            )?;
+            set_orbital_items(&d, &r.orbitals())?;
             d.set_item("unrestricted", r.unrestricted)?;
             if let Some(spin_density) = &r.spin_density {
                 d.set_item("spin_density", matrix_rows(spin_density))?;
@@ -251,6 +276,107 @@ fn single_point(
         other => return Err(PyValueError::new_err(other.execution_error())),
     }
     Ok(d.into())
+}
+
+/// Orbital energies and the HOMO-LUMO pair for any method with a native engine.
+///
+/// Returns the orbital block of `single_point` on its own: the alpha and beta
+/// spectra in eV, the occupation counts, the frontier pair over both spin
+/// channels and per channel, and the gap.
+///
+/// `homo_ev` and `lumo_ev` are read over *both* spin channels, so for an
+/// open-shell doublet the LUMO is usually the beta partner of the singly
+/// occupied orbital rather than the lowest unoccupied alpha orbital. Use
+/// `lumo_alpha_ev` if the alpha diagram alone is what you want. A frontier
+/// orbital that does not exist is `None`.
+#[pyfunction]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto", method="mndo"))]
+fn orbital_energies(
+    py: Python<'_>,
+    numbers: Vec<u8>,
+    positions: Vec<Vec<f64>>,
+    charge: f64,
+    multiplicity: usize,
+    reference: &str,
+    method: &str,
+) -> PyResult<PyObject> {
+    let meth = parse_method(method)?;
+    let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
+    let result = run_method(
+        &mol,
+        meth,
+        &nddo_options(charge, multiplicity, parse_reference(reference)?),
+    )
+    .map_err(to_py_err)?;
+    let d = PyDict::new(py);
+    d.set_item("method", meth.as_str())?;
+    d.set_item("energy_ev", result.total_ev())?;
+    set_orbital_items(&d, &result.orbitals())?;
+    Ok(d.into())
+}
+
+/// A Molden wavefunction file, as a string.
+///
+/// The MO coefficients are back-transformed with `S^(-1/2)` so that they are
+/// orthonormal over the Gaussians in the file. That matters: every engine here
+/// assumes an orthonormal AO basis, while a Molden file describes real
+/// Gaussians, which are not orthonormal, and a reader that took the raw
+/// coefficients would compute a density that does not integrate to the electron
+/// count. Pass `coefficients="raw"` to get the untransformed coefficients for
+/// comparison with programs that make that identification; such a file says so
+/// in its title.
+///
+/// The Slater basis is expanded as STO-6G (Stewart, *J. Chem. Phys.* **52**,
+/// 431 (1970)), and d shells are written in Molden's `[5D]` order.
+#[pyfunction]
+#[pyo3(signature = (numbers, positions, charge=0.0, multiplicity=1, reference="auto",
+                    method="mndo", coefficients="lowdin"))]
+#[allow(clippy::too_many_arguments)]
+fn molden(
+    numbers: Vec<u8>,
+    positions: Vec<Vec<f64>>,
+    charge: f64,
+    multiplicity: usize,
+    reference: &str,
+    method: &str,
+    coefficients: &str,
+) -> PyResult<String> {
+    let meth = parse_method(method)?;
+    let mol = build_molecule(&numbers, &positions, charge, multiplicity)?;
+    let mode = match coefficients.trim().to_ascii_lowercase().as_str() {
+        "lowdin" | "" => MoldenCoefficients::LowdinBackTransformed,
+        "raw" | "raw_zdo" => MoldenCoefficients::RawZdo,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "coefficients must be 'lowdin' or 'raw' (got {other:?})"
+            )))
+        }
+    };
+    molden_string(
+        &mol,
+        meth,
+        &nddo_options(charge, multiplicity, parse_reference(reference)?),
+        mode,
+    )
+    .map_err(to_py_err)
+}
+
+/// The third-party licence and attribution documents this build embeds.
+///
+/// One dict per document, with `path`, `role` and the verbatim `text`. These
+/// are the notices Apache-2.0 4(c) and GPL-3.0 5(a) require to be carried, so
+/// they travel with the installed wheel rather than only with the source tree.
+#[pyfunction]
+fn third_party_licenses(py: Python<'_>) -> PyResult<PyObject> {
+    let out = PyList::empty(py);
+    for doc in crate::licenses::third_party_licenses() {
+        let d = PyDict::new(py);
+        d.set_item("path", doc.path)?;
+        d.set_item("role", doc.role)?;
+        d.set_item("text", doc.text)?;
+        out.append(d)?;
+    }
+    Ok(out.into())
 }
 
 #[pyfunction]
@@ -1030,6 +1156,9 @@ fn api_methods(py: Python<'_>) -> PyResult<PyObject> {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(single_point, m)?)?;
+    m.add_function(wrap_pyfunction!(orbital_energies, m)?)?;
+    m.add_function(wrap_pyfunction!(molden, m)?)?;
+    m.add_function(wrap_pyfunction!(third_party_licenses, m)?)?;
     m.add_function(wrap_pyfunction!(gradient, m)?)?;
     m.add_function(wrap_pyfunction!(forces, m)?)?;
     m.add_function(wrap_pyfunction!(optimize, m)?)?;

@@ -4,11 +4,26 @@ build-backend = "maturin"
 
 [project]
 name = "xndo-rs-python"
-version = "0.2.4"
+version = "0.3.0"
 description = "Rust/Python legacy semiempirical quantum chemistry: CNDO/2, INDO, MNDO, MNDO/d, MINDO/3, ZINDO/S and legacy NDO families"
 readme = "README.md"
 license = "GPL-3.0-or-later"
-license-files = ["LICENSE"]
+# PEP 639. These land in `<dist-info>/licenses/` and are what `pip show -f` and
+# SBOM tooling read, so this list -- not `[tool.maturin] include` -- is the
+# authoritative one for a wheel's attribution.
+license-files = [
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "THIRD_PARTY_LICENSES_RUST.md",
+    "LICENSES/*.txt",
+    "third_party/mopac/LICENSE",
+    "third_party/mopac/AUTHORS.rst",
+    "third_party/mopac/CITATION.cff",
+    "third_party/mopac/PROVENANCE.md",
+    "third_party/molds/NOTICE",
+    "third_party/mopac7/NOTICE",
+]
 requires-python = ">=3.9"
 authors = [{ name = "xndo-rs contributors" }]
 dependencies = ["numpy>=1.21"]

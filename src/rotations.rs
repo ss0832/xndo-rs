@@ -11,7 +11,14 @@
 //! [`crate::dual::Scalar`] so the analytic gradient/Hessian differentiate
 //! through it.
 //!
-//! PROVENANCE: openmopac/mopac v23.2.5 (Apache-2.0). See THIRD_PARTY_NOTICES.md.
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/integrals/mndod.F90 (`rotmat`).
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! rewritten generically over `Scalar`; the array index order is documented
+//! as `d[local][global]`, correcting upstream's comment.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 use crate::dual::Scalar;
 

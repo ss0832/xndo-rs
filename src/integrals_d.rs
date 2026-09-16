@@ -22,9 +22,15 @@
 //! analytic gradient/Hessian differentiate through both the kernel and the
 //! rotation.
 //!
-//! PROVENANCE: openmopac/mopac v23.2.5 (Apache-2.0). See THIRD_PARTY_NOTICES.md.
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/integrals/mndod.F90 and src/integrals/mndod_C.F90.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! evaluates each local-frame integral directly and rotates, bypassing
+//! upstream's `ind2`/`isym`/`rep(491)` symmetry compression.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
-use crate::constants::HARTREE_TO_EV;
 use crate::dual::{Dual, Scalar};
 use crate::integrals::{pack, PairTwoElecG};
 use crate::math::Vec3;
@@ -321,7 +327,7 @@ pub fn pair_two_electron_spd<S: Scalar>(
                 for d in 0..=c {
                     let kl = indexd(c + 1, d + 1);
                     let v = rijkl(ei, ej, ij, kl, LORB[a], LORB[b], LORB[c], LORB[d], 0, r)
-                        * HARTREE_TO_EV;
+                        * ei.hartree_ev;
                     rep[a][b][c][d] = v;
                     rep[a][b][d][c] = v;
                     rep[b][a][c][d] = v;
@@ -396,7 +402,7 @@ pub fn pair_two_electron_spd<S: Scalar>(
     for a in 0..na {
         for b in 0..=a {
             let ij = indexd(a + 1, b + 1);
-            let v = rijkl(ei, ej, ij, 1, LORB[a], LORB[b], 0, 0, 2, r) * HARTREE_TO_EV * (-zb);
+            let v = rijkl(ei, ej, ij, 1, LORB[a], LORB[b], 0, 0, 2, r) * ei.hartree_ev * (-zb);
             e1b_local[a][b] = v;
             e1b_local[b][a] = v;
         }
@@ -404,7 +410,7 @@ pub fn pair_two_electron_spd<S: Scalar>(
     for c in 0..nb {
         for d in 0..=c {
             let kl = indexd(c + 1, d + 1);
-            let v = rijkl(ei, ej, 1, kl, 0, 0, LORB[c], LORB[d], 1, r) * HARTREE_TO_EV * (-za);
+            let v = rijkl(ei, ej, 1, kl, 0, 0, LORB[c], LORB[d], 1, r) * ei.hartree_ev * (-za);
             e2a_local[c][d] = v;
             e2a_local[d][c] = v;
         }

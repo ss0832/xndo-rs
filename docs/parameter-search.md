@@ -1,6 +1,6 @@
 # Missing-parameter search
 
-The 0.2.4 audit retained the search for complete, redistributable parameter and
+The audit, repeated for 0.3.0, retained the search for complete, redistributable parameter and
 Hamiltonian definitions for CNDO/1, INDO/1, INDO/2, ZINDO/1, ZINDO/2,
 MINDO/1, MINDO/2, SINDO1, and MSINDO.
 

@@ -12,12 +12,31 @@
 //! H/Li/C/N/O/S and INDO for H/Li/C/N/O, exactly matching MolDS's enabled
 //! atom lists. Sulfur is not accepted in INDO because its shared row lacks the
 //! complete INDO one-centre coefficients.
+//!
+//! PROVENANCE: derived from MolDS 0.3.1,
+//! Copyright (C) 2011-2012 Mikiya Fujii and (C) 2012-2013 Katsuhiko Nishimra,
+//! licensed under the GNU General Public License, version 3 or later.
+//! UPSTREAM: src/cndo/Cndo2.cpp and src/indo/Indo.cpp.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! native Rust RHF/UHF with analytic derivatives; the dipole uses the NDDO
+//! point-charge plus one-centre form rather than upstream's Gaussian-expanded
+//! position matrix (tests/data/ORACLE_NOTES.md item 24).
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 // AO, atom, and Cartesian indices are intentionally explicit in the fixed-size
 // matrix contractions below; iterator rewrites obscure the equations.
 #![allow(clippy::needless_range_loop)]
 
-use crate::constants::HARTREE_TO_EV;
+use crate::constants::ModelConstants;
+
+/// The constant set MolDS uses, which these two engines are ports of.
+///
+/// MolDS's Hartree is 7.95e-6 above CODATA (`ModelConstants::MOLDS`), and that
+/// multiplies the core repulsion, which runs to hundreds of eV. Using CODATA
+/// here instead left a 5.75e-3 eV disagreement on ethane's core repulsion --
+/// the largest in the CNDO/2 suite -- and about 2e-3 eV on the total energy.
+/// See `tests/data/ORACLE_NOTES.md` item 24.
+const MOLDS: ModelConstants = ModelConstants::MOLDS;
 use crate::data_tables::MOLDS_CNDO2_INDO_PARAM_CSV;
 use crate::dual::{Dual, Scalar};
 use crate::dual2::Dual2;
@@ -25,9 +44,14 @@ use crate::error::{Result, XndoError};
 use crate::linalg::{symmetric_eigen, Matrix};
 use crate::math::Vec3;
 use crate::method::Method;
+use crate::orbitals::OrbitalEnergies;
 use crate::overlap_numeric::overlap_sto;
 use crate::rotations::Rotation;
 use crate::scf::Reference;
+use crate::scf_accel::{
+    lowest_solution, open_shell_starts, sad_density_sp, split_by_spin, uniform_valence_density,
+    Accelerator, ScfAccelerator,
+};
 use crate::system::Molecule;
 use crate::zdo_gradient::{
     atom_population, exchange_weight_rhf, exchange_weight_uhf, pair_energy, solve_rhf_responses,
@@ -168,6 +192,12 @@ pub fn element(z: u8) -> Result<CndoIndoElement> {
             _ => unreachable!(),
         };
         let zeta_d = if has_d { z_eff_md / shell as f64 } else { 0.0 };
+        // Exponents are inverse lengths, so they carry MolDS's Bohr radius into
+        // the crate's internal (CODATA) Bohr. The factor is 1 + 2e-8 and changes
+        // nothing measurable; it is applied so the transformation is the one
+        // `ModelConstants` documents rather than a partial version of it.
+        let zeta_sp = zeta_sp * MOLDS.length_scale();
+        let zeta_d = zeta_d * MOLDS.length_scale();
         return Ok(CndoIndoElement {
             z,
             symbol: f[1].to_string(),
@@ -183,8 +213,10 @@ pub fn element(z: u8) -> Result<CndoIndoElement> {
             zeta_s: zeta_sp,
             zeta_p: if has_p { zeta_sp } else { 0.0 },
             zeta_d,
-            indo_g1_ev: parse_num::<f64>(f[16], "indo_g1_native", z)? * HARTREE_TO_EV,
-            indo_f2_ev: parse_num::<f64>(f[17], "indo_f2_native", z)? * HARTREE_TO_EV,
+            indo_g1_ev: parse_num::<f64>(f[16], "indo_g1_native", z)?
+                * MOLDS.effective_hartree_ev(),
+            indo_f2_ev: parse_num::<f64>(f[17], "indo_f2_native", z)?
+                * MOLDS.effective_hartree_ev(),
             indo_f0_coeff_s: parse_num(f[18], "indo_f0_coeff_s", z)?,
             indo_f0_coeff_p: parse_num(f[19], "indo_f0_coeff_p", z)?,
             indo_g1_coeff_s: parse_num(f[20], "indo_g1_coeff_s", z)?,
@@ -227,6 +259,13 @@ pub struct CndoIndoOptions {
     pub e_tol_ev: f64,
     pub p_tol: f64,
     pub damping: f64,
+    /// SCF convergence accelerator. Defaults to A-DIIS then CDIIS, matching the
+    /// NDDO driver; `damping` applies only when this is `ScfAccelerator::None`.
+    pub accelerator: ScfAccelerator,
+    /// Commutator norm below which A-DIIS hands over to CDIIS.
+    pub adiis_switch: f64,
+    /// Memory budget for the accelerator history, in MiB.
+    pub scf_memory_mb: usize,
 }
 
 impl Default for CndoIndoOptions {
@@ -239,6 +278,9 @@ impl Default for CndoIndoOptions {
             e_tol_ev: 1.0e-8,
             p_tol: 1.0e-7,
             damping: 0.20,
+            accelerator: ScfAccelerator::AdiisCdiis,
+            adiis_switch: 0.1,
+            scf_memory_mb: 512,
         }
     }
 }
@@ -262,8 +304,43 @@ pub struct CndoIndoResult {
     pub core_ev: f64,
     pub total_ev: f64,
     pub charges: Vec<f64>,
+    /// Permanent electric dipole in Debye, in the input frame.
+    ///
+    /// Origin-independent for a neutral molecule, which is what makes it
+    /// comparable with MolDS: MolDS measures its components from a centre it
+    /// chooses and prints the core and electronic halves separately, but the
+    /// sum does not depend on that choice.
+    pub dipole_debye: [f64; 3],
+    pub dipole_magnitude_debye: f64,
     pub iterations: usize,
     pub converged: bool,
+}
+
+impl CndoIndoResult {
+    /// The orbital energies and the frontier quantities read off them.
+    pub fn orbitals(&self) -> OrbitalEnergies {
+        OrbitalEnergies::new(
+            self.mo_energies_ev.clone(),
+            self.n_alpha,
+            self.mo_energies_beta_ev.clone(),
+            self.n_beta,
+        )
+    }
+
+    /// Highest occupied spin orbital over both channels, in eV.
+    pub fn homo_ev(&self) -> Option<f64> {
+        self.orbitals().homo_ev()
+    }
+
+    /// Lowest unoccupied spin orbital over both channels, in eV.
+    pub fn lumo_ev(&self) -> Option<f64> {
+        self.orbitals().lumo_ev()
+    }
+
+    /// HOMO-LUMO gap in eV; `None` unless both frontier orbitals exist.
+    pub fn homo_lumo_gap_ev(&self) -> Option<f64> {
+        self.orbitals().gap_ev()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -514,7 +591,7 @@ fn gamma_ev<S: Scalar>(a: &CndoIndoElement, b: &CndoIndoElement, r_bohr: S) -> S
     let zb = b.zeta_s;
     let gab = gamma_r_one_way(na, za, nb, zb, r_bohr);
     let gba = gamma_r_one_way(nb, zb, na, za, r_bohr);
-    (gab + gba) * (0.5 * HARTREE_TO_EV)
+    (gab + gba) * (0.5 * MOLDS.effective_hartree_ev())
 }
 
 fn gamma_matrix(m: &Molecule, b: &Basis) -> Result<Vec<Vec<f64>>> {
@@ -546,6 +623,95 @@ fn bonding_adjust_k(a: &CndoIndoElement, b: &CndoIndoElement) -> f64 {
     }
 }
 
+/// Atomic-orbital position matrices in Bohr, one per Cartesian axis.
+///
+/// The diagonal is the atom the AO sits on. The off-diagonal carries the
+/// one-centre s-p hybridisation term, `<ns|r|np> = (2n+1) / (2 zeta sqrt(3))`,
+/// which is the same expression MOPAC's `dipol` and the ZINDO/S engine here
+/// use. Leaving it out is a common and quiet error: for a molecule like
+/// ammonia the lone pair's contribution to the dipole lives almost entirely in
+/// that term, and the point-charge part alone gets the magnitude badly wrong.
+///
+/// Any d functions contribute no one-centre dipole of their own to an s/p
+/// hybrid term, so they are left at zero.
+fn ao_position_matrices(m: &Molecule, b: &Basis) -> [Matrix; 3] {
+    let n = b.nao();
+    let mut r = [
+        Matrix::zeros(n, n),
+        Matrix::zeros(n, n),
+        Matrix::zeros(n, n),
+    ];
+    for mu in 0..n {
+        let pos = m.atoms[b.aos[mu].atom].position;
+        r[0][(mu, mu)] = pos.x;
+        r[1][(mu, mu)] = pos.y;
+        r[2][(mu, mu)] = pos.z;
+    }
+    for ia in 0..m.atoms.len() {
+        let e = &b.elements[ia];
+        if b.norb[ia] < 4 || e.zeta_p <= 0.0 {
+            continue;
+        }
+        let n_s = e.valence_shell as f64;
+        let zeta = 0.5 * (e.zeta_s + e.zeta_p);
+        if zeta <= 0.0 {
+            continue;
+        }
+        let rsp = (2.0 * n_s + 1.0) / (2.0 * zeta * 3.0_f64.sqrt());
+        let o = b.offsets[ia];
+        for axis in 0..3 {
+            let p_index = o + 1 + axis;
+            r[axis][(o, p_index)] = rsp;
+            r[axis][(p_index, o)] = rsp;
+        }
+    }
+    r
+}
+
+/// Permanent dipole in electron-Bohr: cores minus the electronic density.
+fn permanent_dipole_au(m: &Molecule, b: &Basis, density: &Matrix) -> [f64; 3] {
+    let r_ao = ao_position_matrices(m, b);
+    let mut mu = [0.0; 3];
+    for (ia, atom) in m.atoms.iter().enumerate() {
+        let zc = b.elements[ia].core_charge;
+        let _ = atom;
+        let pos = m.atoms[ia].position;
+        mu[0] += zc * pos.x;
+        mu[1] += zc * pos.y;
+        mu[2] += zc * pos.z;
+    }
+    let n = b.nao();
+    for (axis, r) in r_ao.iter().enumerate() {
+        let mut electronic = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                electronic += density[(i, j)] * r[(j, i)];
+            }
+        }
+        mu[axis] -= electronic;
+    }
+    mu
+}
+
+fn dipole_debye(m: &Molecule, b: &Basis, density: &Matrix) -> ([f64; 3], f64) {
+    let au = permanent_dipole_au(m, b, density);
+    let d = [
+        au[0] * MOLDS.debye_per_e_bohr(),
+        au[1] * MOLDS.debye_per_e_bohr(),
+        au[2] * MOLDS.debye_per_e_bohr(),
+    ];
+    let magnitude = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    (d, magnitude)
+}
+
+/// An extended-Huckel-like guess Fock.
+///
+/// The driver no longer uses this: it starts from a superposition of atomic
+/// densities instead. What is left is a test fixture -- two Fock-equivalence
+/// tests need *some* plausible set of occupied orbitals to build a density
+/// from, and diagonalising this matrix produces one without hand-writing
+/// coefficients.
+#[cfg(test)]
 fn build_guess_fock(m: &Molecule, b: &Basis, s: &Matrix) -> Matrix {
     let mut f = Matrix::zeros(b.nao(), b.nao());
     for mu in 0..b.nao() {
@@ -856,7 +1022,8 @@ fn core_energy(m: &Molecule, b: &Basis) -> Result<f64> {
                     "coincident atoms in CNDO/2 or INDO".into(),
                 ));
             }
-            e += b.elements[ia].core_charge * b.elements[ja].core_charge / r * HARTREE_TO_EV;
+            e += b.elements[ia].core_charge * b.elements[ja].core_charge / r
+                * MOLDS.effective_hartree_ev();
         }
     }
     Ok(e)
@@ -898,21 +1065,33 @@ fn charges(b: &Basis, p: &Matrix) -> Vec<f64> {
         .collect()
 }
 
+/// Superposition of atomic densities, the same guess every engine now uses.
+///
+/// This replaces diagonalising a guess Fock and filling its lowest orbitals. SAD
+/// costs nothing, carries no orientation of its own, and is what the NDDO driver
+/// already started from.
 fn initial_densities(
-    guess: &Matrix,
+    m: &Molecule,
+    b: &Basis,
     n_alpha: usize,
     n_beta: usize,
     unrestricted: bool,
 ) -> Result<(Matrix, Option<Matrix>)> {
-    let (_, c0) = symmetric_eigen(guess)?;
+    let total = sad_density_sp(b.nao(), &valence_shells(m, b));
     if unrestricted {
-        Ok((
-            c0.leading_columns_gram(n_alpha, 1.0),
-            Some(c0.leading_columns_gram(n_beta, 1.0)),
-        ))
+        let (pa, pb) = split_by_spin(&total, n_alpha, n_beta);
+        Ok((pa, Some(pb)))
     } else {
-        Ok((c0.leading_columns_gram(n_alpha, 2.0), None))
+        Ok((total, None))
     }
+}
+
+/// `(first AO index, AO count, core charge)` per atom, the shape the shared
+/// guess builders in [`crate::scf_accel`] take.
+fn valence_shells(m: &Molecule, b: &Basis) -> Vec<(usize, usize, f64)> {
+    (0..m.atoms.len())
+        .map(|ia| (b.offsets[ia], b.norb[ia], b.elements[ia].core_charge))
+        .collect()
 }
 
 /// Execute MolDS-compatible CNDO/2 or ground-state INDO.
@@ -967,7 +1146,6 @@ pub fn run_cndo_indo(
     let s = build_overlap(m, &b)?;
     let g = gamma_matrix(m, &b)?;
     let h = build_hcore(method, m, &b, &s, &g);
-    let guess = build_guess_fock(m, &b, &s);
     let core = core_energy(m, &b)?;
     let damping = opt.damping.clamp(0.0, 0.95);
     let mut last_energy = f64::INFINITY;
@@ -975,12 +1153,23 @@ pub fn run_cndo_indo(
 
     if reference == Reference::Rhf {
         let n_occ = n_alpha;
-        let (mut p, _) = initial_densities(&guess, n_alpha, n_beta, false)?;
+        let (mut p, _) = initial_densities(m, &b, n_alpha, n_beta, false)?;
+        let mut accel = Accelerator::new(
+            b.nao(),
+            opt.accelerator,
+            opt.adiis_switch,
+            opt.scf_memory_mb,
+        );
         for it in 1..=opt.max_scf {
             let f = build_fock_rhf(method, &b, &h, &g, &p);
-            let (_, c) = symmetric_eigen(&f)?;
+            let f_use = accel.step(f, &p);
+            let (_, c) = symmetric_eigen(&f_use)?;
             let raw = c.leading_columns_gram(n_occ, 2.0);
-            let p_next = damp_density(&raw, &p, damping);
+            let p_next = if accel.is_active() {
+                raw
+            } else {
+                damp_density(&raw, &p, damping)
+            };
             let f_next = build_fock_rhf(method, &b, &h, &g, &p_next);
             let electronic = 0.5 * p_next.frobenius_dot(&add(&h, &f_next));
             let p_error = p_next.rms_difference(&p);
@@ -994,6 +1183,7 @@ pub fn run_cndo_indo(
                 let p_final = coeff.leading_columns_gram(n_occ, 2.0);
                 let f_canonical = build_fock_rhf(method, &b, &h, &g, &p_final);
                 let electronic_final = 0.5 * p_final.frobenius_dot(&add(&h, &f_canonical));
+                let (dipole, dipole_magnitude) = dipole_debye(m, &b, &p_final);
                 return Ok(CndoIndoResult {
                     method,
                     density: p_final.clone(),
@@ -1012,69 +1202,111 @@ pub fn run_cndo_indo(
                     core_ev: core,
                     total_ev: electronic_final + core,
                     charges: charges(&b, &p_final),
+                    dipole_debye: dipole,
+                    dipole_magnitude_debye: dipole_magnitude,
                     iterations: it,
                     converged: true,
                 });
             }
         }
     } else {
-        let (mut pa, pb0) = initial_densities(&guess, n_alpha, n_beta, true)?;
-        let mut pb = pb0.expect("UHF beta density must exist");
-        for it in 1..=opt.max_scf {
-            let (fa, fb) = build_fock_uhf(method, &b, &h, &g, &pa, &pb);
-            let (_, ca) = symmetric_eigen(&fa)?;
-            let (_, cb) = symmetric_eigen(&fb)?;
-            let pa_raw = ca.leading_columns_gram(n_alpha, 1.0);
-            let pb_raw = cb.leading_columns_gram(n_beta, 1.0);
-            let pa_next = damp_density(&pa_raw, &pa, damping);
-            let pb_next = damp_density(&pb_raw, &pb, damping);
-            let (fa_next, fb_next) = build_fock_uhf(method, &b, &h, &g, &pa_next, &pb_next);
-            let pt_next = add(&pa_next, &pb_next);
-            let electronic = 0.5
-                * (pt_next.frobenius_dot(&h)
-                    + pa_next.frobenius_dot(&fa_next)
-                    + pb_next.frobenius_dot(&fb_next));
-            let p_error = pa_next.rms_difference(&pa).max(pb_next.rms_difference(&pb));
-            let e_error = (electronic - last_energy).abs();
-            pa = pa_next;
-            pb = pb_next;
-            last_energy = electronic;
-            last_error = p_error;
-            if p_error < opt.p_tol && e_error < opt.e_tol_ev {
-                let (fa0, fb0) = build_fock_uhf(method, &b, &h, &g, &pa, &pb);
-                let (eps_a, ca) = symmetric_eigen(&fa0)?;
-                let (eps_b, cb) = symmetric_eigen(&fb0)?;
-                let pa_final = ca.leading_columns_gram(n_alpha, 1.0);
-                let pb_final = cb.leading_columns_gram(n_beta, 1.0);
-                let pt_final = add(&pa_final, &pb_final);
-                let (fa_final, fb_final) = build_fock_uhf(method, &b, &h, &g, &pa_final, &pb_final);
-                let electronic_final = 0.5
-                    * (pt_final.frobenius_dot(&h)
-                        + pa_final.frobenius_dot(&fa_final)
-                        + pb_final.frobenius_dot(&fb_final));
-                return Ok(CndoIndoResult {
-                    method,
-                    density: pt_final.clone(),
-                    fock: fa_final,
-                    fock_beta: Some(fb_final),
-                    mo_coeff: ca,
-                    mo_coeff_beta: Some(cb),
-                    mo_energies_ev: eps_a,
-                    mo_energies_beta_ev: Some(eps_b),
-                    n_occ: n_alpha,
-                    n_alpha,
-                    n_beta,
-                    spin_density: Some(sub(&pa_final, &pb_final)),
-                    unrestricted: true,
-                    electronic_ev: electronic_final,
-                    core_ev: core,
-                    total_ev: electronic_final + core,
-                    charges: charges(&b, &pt_final),
-                    iterations: it,
-                    converged: true,
-                });
+        // One SCF per candidate start, keeping the lowest: an open shell's
+        // unpaired electron is assigned by the *first* Fock matrix, which a guess
+        // can order wrongly in a way converging harder never undoes. See
+        // `scf_accel::open_shell_starts`.
+        let solve = |start: (Matrix, Matrix)| -> Result<CndoIndoResult> {
+            let (mut pa, mut pb) = start;
+            let mut last_energy = f64::INFINITY;
+            let mut last_error = f64::INFINITY;
+            // One accelerator for both spin channels. They are *not* independent --
+            // each Fock matrix is built from the total density, so it depends on the
+            // other channel's -- and the textbook UHF-DIIS error vector is the
+            // stacked pair extrapolated with a single set of coefficients.
+            let mut accel = Accelerator::new_uhf(
+                b.nao(),
+                opt.accelerator,
+                opt.adiis_switch,
+                opt.scf_memory_mb,
+            );
+            for it in 1..=opt.max_scf {
+                let (fa, fb) = build_fock_uhf(method, &b, &h, &g, &pa, &pb);
+                let (fa_use, fb_use) = accel.step_uhf(fa, fb, &pa, &pb);
+                let (_, ca) = symmetric_eigen(&fa_use)?;
+                let (_, cb) = symmetric_eigen(&fb_use)?;
+                let pa_raw = ca.leading_columns_gram(n_alpha, 1.0);
+                let pb_raw = cb.leading_columns_gram(n_beta, 1.0);
+                let (pa_next, pb_next) = if accel.is_active() {
+                    (pa_raw, pb_raw)
+                } else {
+                    (
+                        damp_density(&pa_raw, &pa, damping),
+                        damp_density(&pb_raw, &pb, damping),
+                    )
+                };
+                let (fa_next, fb_next) = build_fock_uhf(method, &b, &h, &g, &pa_next, &pb_next);
+                let pt_next = add(&pa_next, &pb_next);
+                let electronic = 0.5
+                    * (pt_next.frobenius_dot(&h)
+                        + pa_next.frobenius_dot(&fa_next)
+                        + pb_next.frobenius_dot(&fb_next));
+                let p_error = pa_next.rms_difference(&pa).max(pb_next.rms_difference(&pb));
+                let e_error = (electronic - last_energy).abs();
+                pa = pa_next;
+                pb = pb_next;
+                last_energy = electronic;
+                last_error = p_error;
+                if p_error < opt.p_tol && e_error < opt.e_tol_ev {
+                    let (fa0, fb0) = build_fock_uhf(method, &b, &h, &g, &pa, &pb);
+                    let (eps_a, ca) = symmetric_eigen(&fa0)?;
+                    let (eps_b, cb) = symmetric_eigen(&fb0)?;
+                    let pa_final = ca.leading_columns_gram(n_alpha, 1.0);
+                    let pb_final = cb.leading_columns_gram(n_beta, 1.0);
+                    let pt_final = add(&pa_final, &pb_final);
+                    let (fa_final, fb_final) =
+                        build_fock_uhf(method, &b, &h, &g, &pa_final, &pb_final);
+                    let electronic_final = 0.5
+                        * (pt_final.frobenius_dot(&h)
+                            + pa_final.frobenius_dot(&fa_final)
+                            + pb_final.frobenius_dot(&fb_final));
+                    let (dipole, dipole_magnitude) = dipole_debye(m, &b, &pt_final);
+                    return Ok(CndoIndoResult {
+                        method,
+                        density: pt_final.clone(),
+                        fock: fa_final,
+                        fock_beta: Some(fb_final),
+                        mo_coeff: ca,
+                        mo_coeff_beta: Some(cb),
+                        mo_energies_ev: eps_a,
+                        mo_energies_beta_ev: Some(eps_b),
+                        n_occ: n_alpha,
+                        n_alpha,
+                        n_beta,
+                        spin_density: Some(sub(&pa_final, &pb_final)),
+                        unrestricted: true,
+                        electronic_ev: electronic_final,
+                        core_ev: core,
+                        total_ev: electronic_final + core,
+                        charges: charges(&b, &pt_final),
+                        dipole_debye: dipole,
+                        dipole_magnitude_debye: dipole_magnitude,
+                        iterations: it,
+                        converged: true,
+                    });
+                }
             }
-        }
+            Err(XndoError::ScfNotConverged {
+                iterations: opt.max_scf,
+                error: last_error,
+            })
+        };
+        let shells = valence_shells(m, &b);
+        let sad = sad_density_sp(b.nao(), &shells);
+        let uniform = uniform_valence_density(b.nao(), &shells);
+        return lowest_solution(
+            open_shell_starts(&sad, &uniform, n_alpha, n_beta),
+            solve,
+            |r| r.total_ev,
+        );
     }
 
     Err(XndoError::ScfNotConverged {
@@ -1133,7 +1365,8 @@ pub(crate) fn analytic_ground_gradient(
                 }
                 None => exchange_weight_rhf(&result.density, oa, na, ob, nb),
             };
-            let core = Dual::constant(ea.core_charge * eb.core_charge * HARTREE_TO_EV) / r;
+            let core =
+                Dual::constant(ea.core_charge * eb.core_charge * MOLDS.effective_hartree_ev()) / r;
             let pair = pair_energy(
                 gamma,
                 core,
@@ -1211,7 +1444,8 @@ pub fn analytic_ground_hessian(
                 Some((pa, pb)) => exchange_weight_uhf(pa, pb, oa, na, ob, nb),
                 None => exchange_weight_rhf(&result.density, oa, na, ob, nb),
             };
-            let core = Dual2::constant(ea.core_charge * eb.core_charge * HARTREE_TO_EV) / r;
+            let core =
+                Dual2::constant(ea.core_charge * eb.core_charge * MOLDS.effective_hartree_ev()) / r;
             for axis in 0..3 {
                 let dg = gamma.g[axis];
                 for &(atom, sign) in &[(ia, -1.0), (ib, 1.0)] {
@@ -1440,7 +1674,7 @@ mod tests {
             let b = gamma_ev(&o, &c, r);
             assert!((a - b).abs() < 1.0e-11);
         }
-        let far = gamma_ev(&c, &o, 20.0) / HARTREE_TO_EV;
+        let far = gamma_ev(&c, &o, 20.0) / MOLDS.effective_hartree_ev();
         assert!((far - 1.0 / 20.0).abs() < 1.0e-5, "far gamma={far}");
     }
 
@@ -1515,7 +1749,7 @@ mod tests {
         ]);
         for method in [Method::Cndo2, Method::Indo] {
             let result = run_cndo_indo(&h2, method, &CndoIndoOptions::default()).unwrap();
-            let energy_h = result.total_ev / HARTREE_TO_EV;
+            let energy_h = result.total_ev / MOLDS.effective_hartree_ev();
             assert!(
                 (energy_h + 1.474625).abs() < 2.0e-4,
                 "{method}: H2 oracle mismatch: {energy_h:.10} Eh"
@@ -1541,9 +1775,16 @@ mod tests {
         // For a normalized 1s Slater charge with zeta=1.2,
         // gamma_HH(0) = 5*zeta/8 = 0.75 Eh. This regression is independent
         // of the general Mulliken auxiliary-function implementation above.
+        //
+        // The stored exponent is the published one times `length_scale`, and the
+        // prefactor is `hartree_to_ev / length_scale`, so the two factors cancel
+        // exactly and the answer is `0.75 * hartree_to_ev` in MolDS's own
+        // Hartree. That cancellation is the whole content of the
+        // `ModelConstants` transformation, and asserting it here at 1e-12 is the
+        // cheapest place it gets checked.
         let hrow = element(1).unwrap();
         let gamma_h = gamma_ev(&hrow, &hrow, 0.0);
-        let expected_gamma = 0.75 * HARTREE_TO_EV;
+        let expected_gamma = 0.75 * MOLDS.hartree_to_ev;
         assert!((gamma_h - expected_gamma).abs() < 1.0e-10);
 
         // A one-electron H atom has no pair interaction after same-spin

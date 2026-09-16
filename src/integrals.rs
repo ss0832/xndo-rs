@@ -7,8 +7,17 @@
 //! `f64` gives the (validated) energy path; instantiating at [`crate::dual::Dual`] gives the
 //! exact derivatives with respect to an interatomic displacement, used by the fully analytic
 //! gradient. Distances are in Bohr, energies in eV (`HARTREE_TO_EV`); orbital order is `s,px,py,pz`.
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/integrals/mndod.F90 (`reppd`, `spcore`).
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! rewritten generically over `Scalar` so the analytic gradient and Hessian
+//! differentiate through it; the energy prefactor comes from the parameter
+//! set rather than a global constant.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
-use crate::constants::HARTREE_TO_EV;
 use crate::dual::{Dual, Scalar};
 use crate::math::Vec3;
 use crate::params::NddoElement;
@@ -189,7 +198,7 @@ pub fn pair_two_electron_g<S: Scalar>(
 
     if !heavy_i && !heavy_j {
         let aee = (ei.rho0 + ej.rho0).powi(2);
-        let ee = (r * r + aee).sqrt().recip() * HARTREE_TO_EV;
+        let ee = (r * r + aee).sqrt().recip() * ei.hartree_ev;
         return PairTwoElecG {
             norb_i: 1,
             norb_j: 1,
@@ -243,7 +252,7 @@ fn core_attraction_g<S: Scalar>(
     let r = (dvec[0] * dvec[0] + dvec[1] * dvec[1] + dvec[2] * dvec[2]).sqrt();
     let core_rho = core.po[9];
     block[0][0] = (r * r + (orbital.po[1] + core_rho).powi(2)).sqrt().recip()
-        * (-core.core_charge * HARTREE_TO_EV);
+        * (-core.core_charge * orbital.hartree_ev);
     if orbital.z < 3 || !orbital.has_p() {
         return block;
     }
@@ -287,14 +296,15 @@ pub fn pair_with_point_core_g<S: Scalar>(
 }
 
 fn local_xh_g<S: Scalar>(ei: &NddoElement, ej: &NddoElement, r: S) -> [S; 4] {
-    let ev1 = HARTREE_TO_EV / 2.0;
-    let ev2 = HARTREE_TO_EV / 4.0;
+    let ev = ei.hartree_ev;
+    let ev1 = ev / 2.0;
+    let ev2 = ev / 4.0;
     let da = S::cst(ei.dd);
     let qa = S::cst(ei.qq * 2.0);
     let aee = (ei.rho0 + ej.rho0).powi(2);
     let ade = (ei.rho1 + ej.rho0).powi(2);
     let aqe = (ei.rho2 + ej.rho0).powi(2);
-    let ee = (r * r + aee).sqrt().recip() * HARTREE_TO_EV;
+    let ee = (r * r + aee).sqrt().recip() * ev;
     let ev1dsqr6 = (r * r + aqe).sqrt().recip() * ev1;
     let mut ri = [S::cst(0.0); 4];
     ri[0] = ee;
@@ -309,10 +319,11 @@ fn local_xh_g<S: Scalar>(ei: &NddoElement, ej: &NddoElement, r: S) -> [S; 4] {
 }
 
 fn local_xx_g<S: Scalar>(ei: &NddoElement, ej: &NddoElement, r: S) -> [S; 22] {
-    let ev1 = HARTREE_TO_EV / 2.0;
-    let ev2 = HARTREE_TO_EV / 4.0;
-    let ev3 = HARTREE_TO_EV / 8.0;
-    let ev4 = HARTREE_TO_EV / 16.0;
+    let ev = ei.hartree_ev;
+    let ev1 = ev / 2.0;
+    let ev2 = ev / 4.0;
+    let ev3 = ev / 8.0;
+    let ev4 = ev / 16.0;
     let da = S::cst(ei.dd);
     let db = S::cst(ej.dd);
     let qa = S::cst(ei.qq * 2.0);
@@ -333,7 +344,7 @@ fn local_xx_g<S: Scalar>(ei: &NddoElement, ej: &NddoElement, r: S) -> [S; 22] {
     let g = |x: S, c: f64| (x + c).sqrt().recip();
     let sq2 = |a: S, c: f64| (a * a + c).sqrt().recip(); // 1/sqrt(a^2 + c)
 
-    let ee = (r * r + aee).sqrt().recip() * HARTREE_TO_EV;
+    let ee = (r * r + aee).sqrt().recip() * ev;
     let dze = sq2(r - da, ade) * ev1 - sq2(r + da, ade) * ev1;
     let ev1dsqr6 = (r * r + aqe).sqrt().recip() * ev1;
     let qzze = sq2(r - qa, aqe) * ev2 + sq2(r + qa, aqe) * ev2 - ev1dsqr6;
@@ -593,7 +604,7 @@ mod tests {
         let a = pair_two_electron(c, c, Vec3::new(1.0, 0.0, 0.0), r);
         let b = pair_two_electron(c, c, Vec3::new(0.3, -0.5, 0.8).normalized(), r);
         assert!((a.w_at(0, 0) - b.w_at(0, 0)).abs() < 1e-9);
-        let expect = HARTREE_TO_EV / (r * r + (2.0 * c.rho0).powi(2)).sqrt();
+        let expect = c.hartree_ev / (r * r + (2.0 * c.rho0).powi(2)).sqrt();
         assert!((a.w_at(0, 0) - expect).abs() < 1e-9);
     }
 

@@ -1,7 +1,7 @@
 # Rust API
 
 This document describes every item re-exported from the `xndo_rs` crate root
-in version 0.2.4. A final module map also identifies the lower-level public
+in version 0.3.0. A final module map also identifies the lower-level public
 modules. The crate has `#![forbid(unsafe_code)]`.
 
 ## Units and result convention
@@ -655,11 +655,15 @@ advanced use:
 | `mindo3` | MINDO/3 SCF, parameters, and analytic derivatives. |
 | `onecenter` | One-center spd integral construction. |
 | `optimizer` | Unified native-method L-BFGS optimizer and trajectory types. |
+| `orbitals` | Orbital energies, occupations and the HOMO/LUMO pair, in one shape for all six methods. |
 | `overlap`, `overlap_numeric` | Analytic/AD and numerical Slater overlap kernels. |
 | `params` | MNDO/MNDO-d parameter parsing and derived multipoles. |
 | `repulsion` | NDDO core-core energies and gradients. |
 | `rotations` | Two-center local-frame rotation matrices. |
 | `scf` | NDDO RHF/UHF driver and memory controls. |
+| `sto` | Stewart STO-nG expansions of a Slater orbital into Gaussians. |
+| `gto` | Overlap integrals over contracted Cartesian and spherical Gaussians. |
+| `molden` | Molden wavefunction output, with the `S^(-1/2)` back-transformation. |
 | `system` | Molecules, atoms, XYZ parsing, and element symbols. |
 | `xndo` | Unified native-method dispatch. |
 | `zindo` | ZINDO/S SCF, CIS/UCIS properties, and state derivatives. |

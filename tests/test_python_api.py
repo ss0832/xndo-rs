@@ -6,9 +6,39 @@ xndo_rs = pytest.importorskip("xndo_rs")
 
 
 def test_top_level_exports():
-    for name in ["single_point", "gradient", "forces", "optimize", "frequencies", "hessian", "excited_states", "excited_properties", "uv_vis_spectrum", "excited_state_gradients", "excited_state_hessians", "available_methods", "api_methods", "parameter_datasets", "parameter_dataset"]:
+    for name in ["single_point", "orbital_energies", "molden", "third_party_licenses", "gradient", "forces", "optimize", "frequencies", "hessian", "excited_states", "excited_properties", "uv_vis_spectrum", "excited_state_gradients", "excited_state_hessians", "available_methods", "api_methods", "parameter_datasets", "parameter_dataset"]:
         assert name in xndo_rs.__all__
         assert callable(getattr(xndo_rs, name))
+
+
+def test_every_native_function_is_wired_through_all_three_layers():
+    """The extension, the shim and the package must export the same set.
+
+    There are three layers -- the pyo3 module `_native`, the `native.py` shim
+    that adapts arrays and documents the arguments, and the package `__init__`
+    that re-exports -- and adding a function to the first without the other two
+    is invisible to a hand-written list of names. It happened: `_native`
+    registered `orbital_energies`, `molden` and `third_party_licenses`, the
+    package `__init__` re-exported all three, the shim defined none of them, and
+    `import xndo_rs` raised AttributeError at line 6 for anyone who installed
+    the wheel. Deriving the expectation from `_native` is what makes the next
+    one fail here instead.
+    """
+    from xndo_rs import native
+    exported = {
+        name for name in dir(native._native)
+        if not name.startswith("_") and callable(getattr(native._native, name))
+    }
+    assert exported, "no functions found in the compiled module"
+    missing_shim = sorted(n for n in exported if not callable(getattr(native, n, None)))
+    assert not missing_shim, f"registered in _native but absent from native.py: {missing_shim}"
+    missing_pkg = sorted(n for n in exported if n not in xndo_rs.__all__)
+    assert not missing_pkg, f"in native.py but not re-exported by the package: {missing_pkg}"
+
+
+def test_no_exported_name_is_dangling():
+    for name in xndo_rs.__all__:
+        assert hasattr(xndo_rs, name), f"__all__ names {name}, which does not resolve"
 
 
 def test_ase_classes_if_available():

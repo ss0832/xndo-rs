@@ -100,6 +100,12 @@ fn cndo_options(options: &NddoOptions) -> CndoIndoOptions {
         e_tol_ev: options.e_tol,
         p_tol: options.p_tol,
         damping: options.damping,
+        // Mirror the accelerator settings too: the finite-difference check is
+        // only meaningful if the displaced runs follow the same SCF path the
+        // analytic derivative was taken along.
+        accelerator: options.accelerator,
+        adiis_switch: options.adiis_switch,
+        scf_memory_mb: options.scf_memory_mb,
     }
 }
 
@@ -139,6 +145,12 @@ fn assert_mindo_hessian(mol: &Molecule, options: &NddoOptions, tolerance: f64) {
         e_tol_ev: options.e_tol,
         p_tol: options.p_tol,
         damping: options.damping,
+        // Mirror the accelerator settings too: the finite-difference check is
+        // only meaningful if the displaced runs follow the same SCF path the
+        // analytic derivative was taken along.
+        accelerator: options.accelerator,
+        adiis_switch: options.adiis_switch,
+        scf_memory_mb: options.scf_memory_mb,
     };
     let (_, _, analytic) = xndo_rs::mindo3::analytic_ground_hessian(mol, &mindo_options).unwrap();
     let step = 2.0e-4;

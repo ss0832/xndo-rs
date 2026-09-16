@@ -1,7 +1,7 @@
 # Python and ASE API
 
 This document describes every public Python function and ASE calculator in
-xndo-rs 0.2.4. The thin wrappers live in `xndo_rs.native`; the same functions
+xndo-rs 0.3.0. The thin wrappers live in `xndo_rs.native`; the same functions
 are re-exported at package level, so `xndo_rs.gradient(...)` and
 `xndo_rs.native.gradient(...)` are equivalent.
 
@@ -82,15 +82,89 @@ Runs a fixed-geometry SCF calculation for any native method. Every result has:
 | `charges` | Net atomic NDO charges, length `N`. |
 | `unrestricted` | Whether the UHF path was used. |
 | `spin_density` | AO spin-density matrix for UHF, otherwise `None`. |
+| `iterations` | SCF iterations taken. |
 | `converged` | SCF convergence flag. Non-convergence normally raises before a result is returned. |
+| `mo_energies_ev`, `mo_energies_beta_ev` | Orbital energies in eV, ascending. Beta is `None` for RHF. |
+| `n_occ`, `n_alpha`, `n_beta` | Occupied counts; `n_occ` is `n_alpha`. |
+| `occupations`, `occupations_beta` | Per-orbital occupation numbers (2.0/0.0 restricted, 1.0/0.0 unrestricted). `occupations_beta` is `None` for RHF. |
+| `homo_ev`, `lumo_ev`, `homo_lumo_gap_ev` | Frontier pair over **both** spin channels, and the gap. |
+| `homo_alpha_ev`, `lumo_alpha_ev`, `homo_beta_ev`, `lumo_beta_ev` | The same per channel. |
+| `dipole_debye` | Permanent dipole components. Not returned by MINDO/3. |
 
-CNDO/2, INDO, MINDO/3, and ZINDO/S additionally return
-`mo_energies_ev`, `mo_energies_beta_ev`, `n_occ`, `n_alpha`, `n_beta`, and
-`iterations`. The beta energies and spin density are `None` for RHF.
+MNDO, MNDO/d and MINDO/3 additionally return `heat_of_formation_kcal`; the
+other three have no atomic heat terms, so their total energy is the comparable
+quantity.
 
-MNDO and MNDO/d additionally return `heat_of_formation_kcal`,
-`dipole_debye`, `homo_ev`, and `lumo_ev`. MINDO/3 also returns
-`heat_of_formation_kcal`.
+Any frontier value that does not exist -- a full or an empty shell -- is `None`
+rather than a substituted number, and so is the gap that would need it.
+
+`homo_ev` and `lumo_ev` are read over both spin channels, so for an open-shell
+doublet the LUMO is usually the beta partner of the singly occupied orbital
+rather than the lowest unoccupied *alpha* orbital. Use `lumo_alpha_ev` when the
+alpha diagram alone is what you want. Alpha and beta eigenvalues come from
+different Fock operators and are not levels of one orbital diagram.
+
+### `orbital_energies`
+
+```python
+orbital_energies(
+    numbers,
+    positions,
+    charge=0.0,
+    multiplicity=1,
+    reference="auto",
+    method="mndo",
+) -> dict
+```
+
+The orbital block of `single_point` on its own, plus `method` and `energy_ev`,
+for any method with a native engine. Use it when the orbitals are what you want
+and the rest of the result is not.
+
+```python
+import xndo_rs
+o = xndo_rs.orbital_energies([6, 1, 1, 1], methyl_xyz, multiplicity=2, method="mindo3")
+print(o["homo_ev"], o["lumo_ev"], o["homo_lumo_gap_ev"])
+```
+
+### `molden`
+
+```python
+molden(
+    numbers,
+    positions,
+    charge=0.0,
+    multiplicity=1,
+    reference="auto",
+    method="mndo",
+    coefficients="lowdin",
+) -> str
+```
+
+A Molden wavefunction file, as a string. The Slater basis is expanded as STO-6G
+(Stewart, *J. Chem. Phys.* **52**, 431 (1970)) and d shells are written in
+Molden's `[5D]` order.
+
+The MO coefficients are back-transformed with `S^(-1/2)`, and that is not
+cosmetic. Every engine here assumes an orthonormal AO basis -- that is what zero
+differential overlap means -- while a Molden file describes real Gaussians,
+which are not orthonormal. A reader given the raw coefficients forms
+`P = C n C^T` over a non-orthogonal basis and gets a density that does not
+integrate to the electron count and orbitals that are not normalised.
+
+`coefficients="raw"` writes the untransformed coefficients, for comparison with
+programs that make that identification. Such a file says so in its own title.
+
+ZINDO/S rejects elements that would need its unimplemented d branch, rather
+than writing a file missing their d coefficients.
+
+```python
+import xndo_rs
+text = xndo_rs.molden([8, 1, 1], water_positions, method="mndo")
+open("water.molden", "w").write(text)
+```
+
+`XNDO.write_molden(path)` does the same from the ASE calculator.
 
 ### `gradient`
 
@@ -377,6 +451,18 @@ dataset names and useful aliases include `mndo`, `mndo_pair`, `mndod`,
 `mndod_pair`, `zindo_s`, `mindo3`, `mindo3_pair`, `molds_cndo2_indo`,
 `molds_zindo_s`, `catalog`, and `manifest`. Unknown names raise `ValueError`;
 call `parameter_datasets()` to discover canonical IDs.
+
+### `third_party_licenses`
+
+```python
+third_party_licenses() -> list[dict]
+```
+
+The licence and attribution documents this build embeds, one dict per document
+with `path`, `role` and the verbatim `text`. These are the notices Apache-2.0
+4(c) and GPL-3.0 5(a) require to be carried, so they travel with the installed
+wheel rather than only with the source tree. The same documents are on disk in
+`.dist-info/licenses/` and printable from the CLI with `xndo_rs_cli licenses`.
 
 ## ASE calculators
 

@@ -83,6 +83,36 @@ class XNDO(Calculator):
         atoms = atoms if atoms is not None else self.atoms
         return -np.asarray(self.get_forces(atoms), dtype=float)
 
+    def get_orbital_energies(self, atoms=None):
+        """Orbital energies in eV, plus the HOMO/LUMO pair and the gap.
+
+        Returns the dictionary ``native.orbital_energies`` produces. ``homo_ev``
+        and ``lumo_ev`` are read over both spin channels, so for an open shell
+        the LUMO is usually the beta partner of the singly occupied orbital
+        rather than the lowest unoccupied alpha orbital; ``lumo_alpha_ev`` is
+        there when the alpha diagram alone is wanted.
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        return native.orbital_energies(*self._args(atoms))
+
+    def write_molden(self, path, atoms=None, coefficients="lowdin"):
+        """Write a Molden wavefunction file.
+
+        The MO coefficients are back-transformed with ``S^(-1/2)`` by default,
+        so that they are orthonormal over the Gaussians in the file. Without
+        that a reader would form ``P = C n C^T`` over a non-orthogonal basis and
+        get a density that does not integrate to the electron count -- the
+        engines here assume an orthonormal AO basis, and a Molden file does not
+        describe one. ``coefficients="raw"`` writes the untransformed
+        coefficients for comparison with programs that make that identification;
+        such a file says so in its own title.
+        """
+        atoms = atoms if atoms is not None else self.atoms
+        text = native.molden(*self._args(atoms), coefficients=coefficients)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        return path
+
 
 class MNDO(XNDO):
     """Method-specific MNDO convenience calculator.

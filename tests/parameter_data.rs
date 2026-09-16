@@ -16,7 +16,10 @@ fn bundled_legacy_parameter_tables_parse() {
     assert_eq!(zindo.rows.len(), 5);
     assert_eq!(m3.rows.len(), 10);
     assert_eq!(m3p.rows.len(), 40);
-    assert_eq!(cat.rows.len(), 6);
+    // Seven since v0.3.0: `element_data.csv` was embedded but absent from the
+    // catalog, the manifest and the notices, so nothing attributed or checked
+    // it. See tests/attribution.rs.
+    assert_eq!(cat.rows.len(), 7);
 }
 
 #[test]

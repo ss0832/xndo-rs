@@ -805,7 +805,9 @@ fn cphf_ov(
     let mut hist_u: Vec<Matrix> = Vec::new();
     let mut hist_e: Vec<Matrix> = Vec::new();
     let max_diis = 8;
-    for _ in 0..100 {
+    let mut converged = false;
+    let mut residual = f64::INFINITY;
+    for _ in 0..CPHF_MAX_ITERATIONS {
         if prof {
             N_CPHF_ITER.fetch_add(1, Ordering::Relaxed);
         }
@@ -835,8 +837,10 @@ fn cphf_ov(
             *ev -= *ov;
             diff += *ev * *ev;
         }
-        if diff.sqrt() < 1.0e-9 {
+        residual = diff.sqrt();
+        if residual < CPHF_TOLERANCE {
             u = u_new;
+            converged = true;
             break;
         }
         // DIIS extrapolation: u   c_i u_new_i minimising  c_i e_i,  c_i = 1.
@@ -848,7 +852,49 @@ fn cphf_ov(
         }
         u = cphf_diis(&hist_u, &hist_e).unwrap_or(u_new);
     }
+    cphf_converged(converged, residual)?;
     Ok(u)
+}
+
+/// Iteration limit for every coupled-perturbed solve.
+///
+/// Was 100, which **water did not fit inside**: its CPHF stalls at a residual
+/// of 1.88e-8 after 100 iterations against a 1e-9 threshold, and converges when
+/// allowed to continue. Since the loops returned their last iterate without
+/// comment, every Hessian this crate has produced was built from a response
+/// that had not met its own stated tolerance. The finite-difference tests
+/// passed anyway -- 2e-8 is a small error -- which is exactly why nothing
+/// noticed.
+///
+/// Five hundred is headroom rather than a measurement: the tests need about
+/// 150, and the limit costs nothing on a run that converges, because it is only
+/// reached when something is wrong. Being generous here and reporting honestly
+/// at the end is the right trade; being stingy and silent was the wrong one.
+const CPHF_MAX_ITERATIONS: usize = 500;
+
+/// Residual at which a coupled-perturbed solve is converged.
+const CPHF_TOLERANCE: f64 = 1.0e-9;
+
+/// Fail if a coupled-perturbed solve ran out of iterations.
+///
+/// All three CPHF loops used to end by falling out of `for _ in 0..100` and
+/// returning the last iterate, with nothing distinguishing that from a
+/// converged one. An unconverged response is not an approximate Hessian, it is
+/// a wrong one, and it arrives looking exactly like a right one -- the caller
+/// gets numbers, the numbers are finite, and the frequencies computed from them
+/// are simply incorrect. Silence is the whole problem, so this reports.
+///
+/// The residual is in the message because "it did not converge" and "it reached
+/// 3e-9 against a 1e-9 threshold" call for different responses, and only the
+/// second one says which.
+fn cphf_converged(converged: bool, residual: f64) -> Result<()> {
+    if converged {
+        return Ok(());
+    }
+    Err(XndoError::ScfNotConverged {
+        iterations: CPHF_MAX_ITERATIONS,
+        error: residual,
+    })
 }
 
 /// Pulay DIIS extrapolation for the CPHF fixed point: solve `B c = [0,1]`
@@ -1096,7 +1142,9 @@ fn cphf_ov_local(
     let co_loc_t = co_loc.transpose();
     let cv_loc_t = cv_loc.transpose();
     let prof = std::env::var("XNDO_TIMING").is_ok();
-    for _ in 0..100 {
+    let mut converged = false;
+    let mut residual = f64::INFINITY;
+    for _ in 0..CPHF_MAX_ITERATIONS {
         if prof {
             N_CPHF_ITER.fetch_add(1, Ordering::Relaxed);
             N_LOC_AOS.fetch_max(n_loc as u64, Ordering::Relaxed);
@@ -1152,8 +1200,10 @@ fn cphf_ov_local(
             *ev -= *ov;
             diff += *ev * *ev;
         }
-        if diff.sqrt() < 1.0e-9 {
+        residual = diff.sqrt();
+        if residual < CPHF_TOLERANCE {
             u = u_new;
+            converged = true;
             break;
         }
         hist_u.push(u_new.clone());
@@ -1164,6 +1214,7 @@ fn cphf_ov_local(
         }
         u = cphf_diis(&hist_u, &hist_e).unwrap_or(u_new);
     }
+    cphf_converged(converged, residual)?;
     Ok(u)
 }
 
@@ -1588,7 +1639,9 @@ fn ucphf_ov(
     };
     let mut ua = div(ga, denom_a);
     let mut ub = div(gb, denom_b);
-    for _ in 0..100 {
+    let mut converged = false;
+    let mut residual = f64::INFINITY;
+    for _ in 0..CPHF_MAX_ITERATIONS {
         let dpa = ao_response_density_w(&ua, cva, coa, 1.0);
         let dpb = ao_response_density_w(&ub, cvb, cob, 1.0);
         let mut dpt = dpa.clone();
@@ -1625,10 +1678,13 @@ fn ucphf_ov(
         }
         ua = ua_new;
         ub = ub_new;
-        if diff.sqrt() < 1.0e-9 {
+        residual = diff.sqrt();
+        if residual < CPHF_TOLERANCE {
+            converged = true;
             break;
         }
     }
+    cphf_converged(converged, residual)?;
     Ok((ua, ub))
 }
 

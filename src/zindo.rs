@@ -18,6 +18,16 @@
 //! gradients/Hessians.
 //! Excited-state optimization and nonadiabatic derivative couplings are not
 //! provided.
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/INDO/scf.F90, integral.F90, ovlp.F90, ci.F90, reimers_C.F90, parameters_for_INDO_C.F90.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! the two-centre exchange integral is zero under ZDO, corrected from an
+//! earlier transcription; the CIS is built from a co-density factorisation
+//! rather than upstream's element-wise transform.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 // AO, state, and Cartesian indices are intentionally explicit in the
 // response-equation matrix contractions below.
@@ -32,7 +42,12 @@ use crate::dual2::Dual2;
 use crate::error::{Result, XndoError};
 use crate::linalg::{symmetric_eigen, Matrix};
 use crate::math::Vec3;
+use crate::orbitals::OrbitalEnergies;
 use crate::scf::Reference;
+use crate::scf_accel::{
+    lowest_solution, open_shell_starts, sad_density_sp, uniform_valence_density, Accelerator,
+    ScfAccelerator,
+};
 use crate::system::Molecule;
 use crate::zdo_gradient::{
     atom_population, exchange_weight_rhf, exchange_weight_uhf, pair_energy, solve_rhf_responses,
@@ -48,7 +63,17 @@ pub const ZINDO_AU2ANG: f64 = 0.529_177;
 pub const ZINDO_TOMK: f64 = 1.2;
 pub const EV_NM: f64 = 1_239.841_984_332_002_6;
 pub const EV_TO_WAVENUMBER_CM1: f64 = 8_065.544_005;
-pub const DEBYE_PER_E_BOHR: f64 = 2.541_746_473;
+/// Dipole conversion for the INDO/S model, in Debye per electron-Bohr.
+///
+/// MOPAC's INDO module does not use either of the constant sets in
+/// \conref_C.F90\; it carries \debye = 4.80294\ privately
+/// (\src/INDO/reimers_C.F90:93\), which is the *historical* electron-Angstrom
+/// conversion rounded to six figures, 5.5e-5 below the CODATA value. Its dipole
+/// matrix is built in eA (\dipol\, \integral.F90:621\), so the factor that
+/// reaches an internal electron-Bohr dipole is that value times the CODATA Bohr
+/// radius. Using the CODATA conversion instead left a 5.5e-5 relative offset on
+/// every ZINDO/S dipole.
+pub const DEBYE_PER_E_BOHR: f64 = crate::constants::BOHR_TO_ANGSTROM * 4.80294;
 
 /// OpenMOPAC stores FG14..FG21 multiplied by these integer convention factors
 /// and divides them on entry to INDO/S (`switch.F90`).  FG22..FG24 are unscaled.
@@ -207,6 +232,22 @@ pub struct ZindoOptions {
     pub p_tol: f64,
     /// Linear density damping: `P_next = (1 - damping) P_new + damping P_old`.
     pub damping: f64,
+    /// SCF convergence accelerator. Defaults to A-DIIS then CDIIS, as the NDDO
+    /// driver does.
+    ///
+    /// Without one, this engine is a plain damped Roothaan iteration, which on a
+    /// system with degenerate frontier orbitals settles on whichever member of
+    /// the degenerate pair the aufbau happened to occupy. That is what made BH
+    /// converge to a solution 7.3 eV above the correct one when its bond lay
+    /// along z, and what stopped benzene converging at all
+    /// (`tests/data/ORACLE_NOTES.md` items 18 and 19).
+    ///
+    /// `damping` is used only when this is `ScfAccelerator::None`.
+    pub accelerator: ScfAccelerator,
+    /// Commutator norm below which A-DIIS hands over to CDIIS.
+    pub adiis_switch: f64,
+    /// Memory budget for the accelerator history, in MiB.
+    pub scf_memory_mb: usize,
     pub n_states: usize,
     /// Optional number of occupied orbitals nearest the HOMO retained in CIS.
     pub active_occupied: Option<usize>,
@@ -224,6 +265,9 @@ impl Default for ZindoOptions {
             e_tol_ev: 1.0e-8,
             p_tol: 1.0e-7,
             damping: 0.20,
+            accelerator: ScfAccelerator::AdiisCdiis,
+            adiis_switch: 0.1,
+            scf_memory_mb: 512,
             n_states: 10,
             active_occupied: None,
             active_virtual: None,
@@ -249,8 +293,45 @@ pub struct ZindoResult {
     pub core_ev: f64,
     pub total_ev: f64,
     pub charges: Vec<f64>,
+    /// Permanent electric dipole in Debye: the atom-centred point-charge term
+    /// plus the one-centre s-p hybridisation term, the same decomposition
+    /// `NddoResult::dipole_debye` uses and the same one MOPAC prints as
+    /// POINT-CHG. + HYBRID.
+    pub dipole_debye: [f64; 3],
+    pub dipole_magnitude_debye: f64,
     pub iterations: usize,
     pub converged: bool,
+}
+
+impl ZindoResult {
+    /// The orbital energies and the frontier quantities read off them.
+    pub fn orbitals(&self) -> OrbitalEnergies {
+        OrbitalEnergies::new(
+            self.mo_energies_ev.clone(),
+            self.n_alpha,
+            self.mo_energies_beta_ev.clone(),
+            self.n_beta,
+        )
+    }
+
+    /// Highest occupied spin orbital over both channels, in eV.
+    pub fn homo_ev(&self) -> Option<f64> {
+        self.orbitals().homo_ev()
+    }
+
+    /// Lowest unoccupied spin orbital over both channels, in eV.
+    pub fn lumo_ev(&self) -> Option<f64> {
+        self.orbitals().lumo_ev()
+    }
+
+    /// HOMO-LUMO gap in eV; `None` unless both frontier orbitals exist.
+    ///
+    /// ZINDO/S is a spectroscopic parameterisation, so this gap is not an
+    /// estimate of the lowest excitation energy: that is what
+    /// [`crate::zindo_s_cis`] is for, and the two differ by the CIS coupling.
+    pub fn homo_lumo_gap_ev(&self) -> Option<f64> {
+        self.orbitals().gap_ev()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -457,8 +538,30 @@ fn transpose4<S: Scalar>(a: [[S; 4]; 4]) -> [[S; 4]; 4] {
     b
 }
 
+/// Zerner's INDO/S weighting of the p-p sigma component of the resonance
+/// overlap.
+///
+/// PROVENANCE: openmopac/mopac v23.2.5 (Apache-2.0),
+///   Copyright 2021 Virginia Polytechnic Institute and State University.
+///   `src/INDO/reimers_C.F90:120` declares
+///   `data fintfa / 1.D0, 1.267D0, 0.585D0, 3*1.D0 /`, equivalenced at `:133-135`
+///   to `(fssig, fpsig, fppi, fdsig, fdpi, fddel)`. `src/INDO/ovlp.F90:139-147`
+///   loads them into `fspdf`, which its own comment at `:134` calls the
+///   weighting factor, and applies them to **same-l pairs only**.
+const F_P_SIGMA: f64 = 1.267;
+/// Zerner's INDO/S weighting of the p-p pi component. See [`F_P_SIGMA`].
+const F_P_PI: f64 = 0.585;
+
 /// s/p Slater overlap block using the same orientation/sign convention as the
 /// generic NDDO overlap kernel.  ZINDO/S uses one common exponent for s and p.
+///
+/// The returned block is the **resonance-weighted** overlap, not the plain
+/// Slater overlap: Zerner's sigma/pi factors are folded in (see [`F_P_SIGMA`]).
+/// In this engine the overlap is consumed only by the resonance integral
+/// (`build_core`, and the `beta * S * P` terms of the derivative paths), which
+/// is exactly where MOPAC applies them, so the weighting belongs here. Any
+/// future consumer that needs a true overlap - a population analysis, a Loewdin
+/// orthogonalisation, a wavefunction export - must build its own.
 fn sp_overlap_block_g<S: Scalar>(ei: &ZindoElement, ej: &ZindoElement, d: [S; 3]) -> [[S; 4]; 4] {
     let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
     if r.val() < 1.0e-14 {
@@ -474,7 +577,17 @@ fn sp_overlap_block_g<S: Scalar>(ei: &ZindoElement, ej: &ZindoElement, d: [S; 3]
     let (s111, s211, s121, s221, s222) = crate::overlap_numeric::slater_locals_numeric(
         ea.n_s, ea.n_p, ea.zeta_sp, ea.zeta_sp, eb.n_s, eb.n_p, eb.zeta_sp, eb.zeta_sp, r,
     );
-    let di = crate::overlap::build_di_g::<S>([s111, s211, s121, s221, s222], direction);
+    // Zerner's sigma/pi weighting, applied in the diatomic local frame before
+    // the rotation, exactly as MOPAC does. MOPAC weights same-l pairs only and
+    // averages the two centres' factors, so for an s/p basis:
+    //   s111 (s-s sigma)      -> (fssig + fssig) / 2 = 1
+    //   s211, s121 (s-p sigma)-> cross-l, weight 1
+    //   s221 (p-p sigma)      -> (fpsig + fpsig) / 2 = F_P_SIGMA
+    //   s222 (p-p pi)         -> (fppi  + fppi ) / 2 = F_P_PI
+    let di = crate::overlap::build_di_g::<S>(
+        [s111, s211, s121, s221 * F_P_SIGMA, s222 * F_P_PI],
+        direction,
+    );
     if swap {
         transpose4(di)
     } else {
@@ -550,6 +663,22 @@ fn uform_sp(e: &ZindoElement, orb: usize) -> f64 {
 
 /// Build the INDO/S Coulomb (J) and exchange (K) AO-pair kernels used by the
 /// closed-shell SCF and by the CIS integral transformation.
+///
+/// `j[mu][nu]` is the Coulomb integral `(mu mu|nu nu)`: `gamma_AB` when the two
+/// AOs sit on different atoms, the one-centre Slater-Condon combination when
+/// they share an atom.
+///
+/// `k[mu][nu]` is the *exchange integral* `(mu nu|mu nu)`, which under ZDO
+/// exists **only within one atom** - differential overlap between AOs on
+/// different atoms is zero by construction, so `k` is zero off-atom. INDO's
+/// defining feature over CNDO is precisely that it keeps these one-centre
+/// exchange terms (`G1`, `3*F2`).
+///
+/// The `-0.5 * P_mu_nu * gamma_AB` term in the two-centre Fock element is *not*
+/// a two-centre exchange integral: it is the Coulomb integral `(mu mu|nu nu)`
+/// appearing in the exchange contraction `sum_lambda_sigma P_lambda_sigma
+/// (mu lambda|nu sigma)` at `lambda = mu`, `sigma = nu`. The Fock builders
+/// therefore read `j` there, not `k`.
 fn build_jk(
     mol: &Molecule,
     params: &ZindoParameters,
@@ -569,7 +698,7 @@ fn build_jk(
                     * ZINDO_AU2ANG;
                 let g = gamma1(em.fg[11], en.fg[11], r_ang);
                 j[(mu, nu)] = g;
-                k[(mu, nu)] = g;
+                // k stays zero: (mu nu|mu nu) vanishes across atoms under ZDO.
                 continue;
             }
             let f0 = em.fg[11];
@@ -658,7 +787,9 @@ fn build_fock_closed(h: &Matrix, p: &Matrix, j: &Matrix, k: &Matrix, basis: &ZBa
             let v = if am.atom == an.atom {
                 h[(mu, nu)] + (1.5 * k[(mu, nu)] - 0.5 * j[(mu, nu)]) * p[(mu, nu)]
             } else {
-                h[(mu, nu)] - 0.5 * k[(mu, nu)] * p[(mu, nu)]
+                // Coulomb integral in the exchange position, not a two-centre
+                // exchange integral - see build_jk.
+                h[(mu, nu)] - 0.5 * j[(mu, nu)] * p[(mu, nu)]
             };
             f[(mu, nu)] = v;
             f[(nu, mu)] = v;
@@ -707,9 +838,11 @@ fn build_fock_uhf(
                         - (j[(mu, nu)] + k[(mu, nu)]) * pb[(mu, nu)],
                 )
             } else {
+                // As in build_fock_closed: the two-centre exchange position is
+                // fed by the Coulomb integral gamma_AB, which lives in j.
                 (
-                    h[(mu, nu)] - k[(mu, nu)] * pa[(mu, nu)],
-                    h[(mu, nu)] - k[(mu, nu)] * pb[(mu, nu)],
+                    h[(mu, nu)] - j[(mu, nu)] * pa[(mu, nu)],
+                    h[(mu, nu)] - j[(mu, nu)] * pb[(mu, nu)],
                 )
             };
             fa[(mu, nu)] = va;
@@ -722,23 +855,25 @@ fn build_fock_uhf(
 }
 
 fn atomic_density(mol: &Molecule, params: &ZindoParameters, basis: &ZBasis) -> Result<Matrix> {
-    let n = basis.nao();
-    let mut p = Matrix::zeros(n, n);
-    for ia in 0..mol.atoms.len() {
-        let e = params.element(mol.atoms[ia].z)?;
-        let o = basis.atom_offset[ia];
-        if e.n_orb == 1 {
-            p[(o, o)] = e.core_charge.min(2.0);
-        } else {
-            let ns = e.core_charge.min(2.0);
-            p[(o, o)] = ns;
-            let np = (e.core_charge - ns).max(0.0) / 3.0;
-            for q in 1..=3 {
-                p[(o + q, o + q)] = np;
-            }
-        }
-    }
-    Ok(p)
+    Ok(sad_density_sp(
+        basis.nao(),
+        &valence_shells(mol, params, basis)?,
+    ))
+}
+
+/// `(first AO index, AO count, core charge)` per atom, the shape the shared
+/// guess builders in [`crate::scf_accel`] take.
+fn valence_shells(
+    mol: &Molecule,
+    params: &ZindoParameters,
+    basis: &ZBasis,
+) -> Result<Vec<(usize, usize, f64)>> {
+    (0..mol.atoms.len())
+        .map(|ia| -> Result<(usize, usize, f64)> {
+            let e = params.element(mol.atoms[ia].z)?;
+            Ok((basis.atom_offset[ia], e.n_orb, e.core_charge))
+        })
+        .collect()
 }
 
 fn electron_count(mol: &Molecule, params: &ZindoParameters, charge: f64) -> Result<usize> {
@@ -862,27 +997,67 @@ pub fn run_zindo_s(
     let damping = options.damping.clamp(0.0, 0.95);
     let mut last_e = f64::INFINITY;
     let mut last_err = f64::INFINITY;
-    let (_, initial_coefficients) = symmetric_eigen(&guess)?;
+    // Start from the superposition of atomic densities itself.
+    //
+    // This used to diagonalise the SAD matrix and take its leading columns. That
+    // is wrong twice over. `symmetric_eigen` returns eigenvalues in *ascending*
+    // order, so the leading columns are the orbitals with the **smallest**
+    // atomic populations: for BH the guess is diag(2, 1/3, 1/3, 1/3, 1) and the
+    // first two columns are two of the three degenerate p orbitals, so the
+    // iteration began with all four electrons in p and none in s. And because
+    // the AO basis is fixed to the global axes while the molecule is not, which
+    // p orbitals those are depends on the molecule's orientation -- putting the
+    // electrons in pi orbitals for a bond along z and in a sigma orbital for a
+    // bond along x. That is what made the converged energy orientation-dependent
+    // (`tests/data/ORACLE_NOTES.md` item 19).
+    //
+    // `atomic_density` already returns a total density with the right trace, so
+    // it is the guess; the NDDO driver uses its own SAD the same way.
     if reference == Reference::Rhf {
         let n_occ = n_alpha;
-        let mut p = initial_coefficients.leading_columns_gram(n_occ, 2.0);
+        let mut p = guess.clone();
+        let mut accel = Accelerator::new(
+            basis.nao(),
+            options.accelerator,
+            options.adiis_switch,
+            options.scf_memory_mb,
+        );
         for iter in 1..=options.max_scf {
             let f = build_fock_closed(&h, &p, &j, &k, &basis);
-            let (_, c) = symmetric_eigen(&f)?;
-            let p_next = damp_density(&c.leading_columns_gram(n_occ, 2.0), &p, damping);
-            let f_next = build_fock_closed(&h, &p_next, &j, &k, &basis);
-            let e = 0.5 * p_next.frobenius_dot(&add_matrix(&h, &f_next));
+            // The energy belongs to the density that built this Fock, so it is
+            // evaluated here rather than from a second Fock build after the
+            // update -- which is also what removes the duplicate build this loop
+            // used to do every iteration.
+            let e = 0.5 * p.frobenius_dot(&add_matrix(&h, &f));
+            let f_use = accel.step(f, &p);
+            let (_, c) = symmetric_eigen(&f_use)?;
+            let raw = c.leading_columns_gram(n_occ, 2.0);
+            let p_next = if accel.is_active() {
+                raw
+            } else {
+                damp_density(&raw, &p, damping)
+            };
             let p_err = p_next.rms_difference(&p);
             let e_err = (e - last_e).abs();
             p = p_next;
             last_e = e;
             last_err = p_err;
-            if p_err < options.p_tol && e_err < options.e_tol_ev {
+            if iter > 1 && p_err < options.p_tol && e_err < options.e_tol_ev {
                 let f0 = build_fock_closed(&h, &p, &j, &k, &basis);
                 let (eps, c) = symmetric_eigen(&f0)?;
                 let p_final = c.leading_columns_gram(n_occ, 2.0);
                 let f_final = build_fock_closed(&h, &p_final, &j, &k, &basis);
                 let electronic_ev = 0.5 * p_final.frobenius_dot(&add_matrix(&h, &f_final));
+                let dipole = scale3(
+                    permanent_dipole_au(
+                        mol,
+                        params,
+                        &basis,
+                        &p_final,
+                        &ao_position_matrices(mol, params, &basis)?,
+                    )?,
+                    DEBYE_PER_E_BOHR,
+                );
                 return Ok(ZindoResult {
                     density: p_final.clone(),
                     fock: f_final,
@@ -900,66 +1075,116 @@ pub fn run_zindo_s(
                     core_ev,
                     total_ev: electronic_ev + core_ev,
                     charges: charges(mol, params, &basis, &p_final)?,
+                    dipole_debye: dipole,
+                    dipole_magnitude_debye: norm3(dipole),
                     iterations: iter,
                     converged: true,
                 });
             }
         }
     } else {
-        let mut pa = initial_coefficients.leading_columns_gram(n_alpha, 1.0);
-        let mut pb = initial_coefficients.leading_columns_gram(n_beta, 1.0);
-        for iter in 1..=options.max_scf {
-            let (fa, fb) = build_fock_uhf(&h, &pa, &pb, &j, &k, &basis);
-            let (_, ca) = symmetric_eigen(&fa)?;
-            let (_, cb) = symmetric_eigen(&fb)?;
-            let pa_next = damp_density(&ca.leading_columns_gram(n_alpha, 1.0), &pa, damping);
-            let pb_next = damp_density(&cb.leading_columns_gram(n_beta, 1.0), &pb, damping);
-            let (fa_next, fb_next) = build_fock_uhf(&h, &pa_next, &pb_next, &j, &k, &basis);
-            let total_next = add_matrix(&pa_next, &pb_next);
-            let e = 0.5
-                * (total_next.frobenius_dot(&h)
-                    + pa_next.frobenius_dot(&fa_next)
-                    + pb_next.frobenius_dot(&fb_next));
-            let p_err = pa_next.rms_difference(&pa).max(pb_next.rms_difference(&pb));
-            let e_err = (e - last_e).abs();
-            pa = pa_next;
-            pb = pb_next;
-            last_e = e;
-            last_err = p_err;
-            if p_err < options.p_tol && e_err < options.e_tol_ev {
-                let (fa0, fb0) = build_fock_uhf(&h, &pa, &pb, &j, &k, &basis);
-                let (eps_a, ca) = symmetric_eigen(&fa0)?;
-                let (eps_b, cb) = symmetric_eigen(&fb0)?;
-                let pa_final = ca.leading_columns_gram(n_alpha, 1.0);
-                let pb_final = cb.leading_columns_gram(n_beta, 1.0);
-                let density = add_matrix(&pa_final, &pb_final);
-                let (fa_final, fb_final) = build_fock_uhf(&h, &pa_final, &pb_final, &j, &k, &basis);
-                let electronic_ev = 0.5
-                    * (density.frobenius_dot(&h)
-                        + pa_final.frobenius_dot(&fa_final)
-                        + pb_final.frobenius_dot(&fb_final));
-                return Ok(ZindoResult {
-                    density: density.clone(),
-                    fock: fa_final,
-                    fock_beta: Some(fb_final),
-                    mo_coeff: ca,
-                    mo_coeff_beta: Some(cb),
-                    mo_energies_ev: eps_a,
-                    mo_energies_beta_ev: Some(eps_b),
-                    n_occ: n_alpha,
-                    n_alpha,
-                    n_beta,
-                    spin_density: Some(sub_matrix(&pa_final, &pb_final)),
-                    unrestricted: true,
-                    electronic_ev,
-                    core_ev,
-                    total_ev: electronic_ev + core_ev,
-                    charges: charges(mol, params, &basis, &density)?,
-                    iterations: iter,
-                    converged: true,
-                });
+        // One SCF per candidate start, keeping the lowest: an open shell's
+        // unpaired electron is assigned by the *first* Fock matrix, which a guess
+        // can order wrongly in a way converging harder never undoes. See
+        // `scf_accel::open_shell_starts`.
+        let solve = |start: (Matrix, Matrix)| -> Result<ZindoResult> {
+            let (mut pa, mut pb) = start;
+            let mut last_e = f64::INFINITY;
+            let mut last_err = f64::INFINITY;
+            // One accelerator for both spin channels, as on the RHF path above and
+            // in the other three engines. This loop had none at all, so the UHF
+            // ZINDO/S path was the one place the A-DIIS/CDIIS default did not apply.
+            let mut accel = Accelerator::new_uhf(
+                basis.nao(),
+                options.accelerator,
+                options.adiis_switch,
+                options.scf_memory_mb,
+            );
+            for iter in 1..=options.max_scf {
+                let (fa, fb) = build_fock_uhf(&h, &pa, &pb, &j, &k, &basis);
+                let (fa_use, fb_use) = accel.step_uhf(fa, fb, &pa, &pb);
+                let (_, ca) = symmetric_eigen(&fa_use)?;
+                let (_, cb) = symmetric_eigen(&fb_use)?;
+                let pa_raw = ca.leading_columns_gram(n_alpha, 1.0);
+                let pb_raw = cb.leading_columns_gram(n_beta, 1.0);
+                let (pa_next, pb_next) = if accel.is_active() {
+                    (pa_raw, pb_raw)
+                } else {
+                    (
+                        damp_density(&pa_raw, &pa, damping),
+                        damp_density(&pb_raw, &pb, damping),
+                    )
+                };
+                let (fa_next, fb_next) = build_fock_uhf(&h, &pa_next, &pb_next, &j, &k, &basis);
+                let total_next = add_matrix(&pa_next, &pb_next);
+                let e = 0.5
+                    * (total_next.frobenius_dot(&h)
+                        + pa_next.frobenius_dot(&fa_next)
+                        + pb_next.frobenius_dot(&fb_next));
+                let p_err = pa_next.rms_difference(&pa).max(pb_next.rms_difference(&pb));
+                let e_err = (e - last_e).abs();
+                pa = pa_next;
+                pb = pb_next;
+                last_e = e;
+                last_err = p_err;
+                if p_err < options.p_tol && e_err < options.e_tol_ev {
+                    let (fa0, fb0) = build_fock_uhf(&h, &pa, &pb, &j, &k, &basis);
+                    let (eps_a, ca) = symmetric_eigen(&fa0)?;
+                    let (eps_b, cb) = symmetric_eigen(&fb0)?;
+                    let pa_final = ca.leading_columns_gram(n_alpha, 1.0);
+                    let pb_final = cb.leading_columns_gram(n_beta, 1.0);
+                    let density = add_matrix(&pa_final, &pb_final);
+                    let (fa_final, fb_final) =
+                        build_fock_uhf(&h, &pa_final, &pb_final, &j, &k, &basis);
+                    let electronic_ev = 0.5
+                        * (density.frobenius_dot(&h)
+                            + pa_final.frobenius_dot(&fa_final)
+                            + pb_final.frobenius_dot(&fb_final));
+                    let dipole = scale3(
+                        permanent_dipole_au(
+                            mol,
+                            params,
+                            &basis,
+                            &density,
+                            &ao_position_matrices(mol, params, &basis)?,
+                        )?,
+                        DEBYE_PER_E_BOHR,
+                    );
+                    return Ok(ZindoResult {
+                        density: density.clone(),
+                        fock: fa_final,
+                        fock_beta: Some(fb_final),
+                        mo_coeff: ca,
+                        mo_coeff_beta: Some(cb),
+                        mo_energies_ev: eps_a,
+                        mo_energies_beta_ev: Some(eps_b),
+                        n_occ: n_alpha,
+                        n_alpha,
+                        n_beta,
+                        spin_density: Some(sub_matrix(&pa_final, &pb_final)),
+                        unrestricted: true,
+                        electronic_ev,
+                        core_ev,
+                        total_ev: electronic_ev + core_ev,
+                        charges: charges(mol, params, &basis, &density)?,
+                        dipole_debye: dipole,
+                        dipole_magnitude_debye: norm3(dipole),
+                        iterations: iter,
+                        converged: true,
+                    });
+                }
             }
-        }
+            Err(XndoError::ScfNotConverged {
+                iterations: options.max_scf,
+                error: last_err,
+            })
+        };
+        let uniform = uniform_valence_density(basis.nao(), &valence_shells(mol, params, &basis)?);
+        return lowest_solution(
+            open_shell_starts(&guess, &uniform, n_alpha, n_beta),
+            solve,
+            |r| r.total_ev,
+        );
     }
     Err(XndoError::ScfNotConverged {
         iterations: options.max_scf,
@@ -1271,7 +1496,7 @@ fn pair_coordinate(pair: &ZindoPairDerivatives, coordinate: usize) -> Option<(us
 
 fn zindo_jk_derivative(data: &ZindoResponseData, coordinate: usize) -> (Matrix, Matrix) {
     let mut jx = Matrix::zeros(data.basis.nao(), data.basis.nao());
-    let mut kx = Matrix::zeros(data.basis.nao(), data.basis.nao());
+    let kx = Matrix::zeros(data.basis.nao(), data.basis.nao());
     for pair in &data.pairs {
         let Some((axis, sign)) = pair_coordinate(pair, coordinate) else {
             continue;
@@ -1285,11 +1510,11 @@ fn zindo_jk_derivative(data: &ZindoResponseData, coordinate: usize) -> (Matrix, 
                 let nu = ob + q;
                 jx[(mu, nu)] = value;
                 jx[(nu, mu)] = value;
-                kx[(mu, nu)] = value;
-                kx[(nu, mu)] = value;
             }
         }
     }
+    // kx stays zero everywhere: the exchange integral (mu nu|mu nu) is
+    // one-centre only, and one-centre integrals do not depend on geometry.
     (jx, kx)
 }
 
@@ -1299,7 +1524,7 @@ fn zindo_jk_second_derivative(
     coordinate_y: usize,
 ) -> (Matrix, Matrix) {
     let mut jxy = Matrix::zeros(data.basis.nao(), data.basis.nao());
-    let mut kxy = Matrix::zeros(data.basis.nao(), data.basis.nao());
+    let kxy = Matrix::zeros(data.basis.nao(), data.basis.nao());
     for pair in &data.pairs {
         let (Some((axis_x, sign_x)), Some((axis_y, sign_y))) = (
             pair_coordinate(pair, coordinate_x),
@@ -1316,11 +1541,10 @@ fn zindo_jk_second_derivative(
                 let nu = ob + q;
                 jxy[(mu, nu)] = value;
                 jxy[(nu, mu)] = value;
-                kxy[(mu, nu)] = value;
-                kxy[(nu, mu)] = value;
             }
         }
     }
+    // kxy stays zero: see zindo_jk_derivative.
     (jxy, kxy)
 }
 
@@ -2544,7 +2768,7 @@ fn build_ucis_matrix_second_derivative(
 
 fn zindo_uhf_jk_derivative(data: &ZindoUhfResponseData, coordinate: usize) -> (Matrix, Matrix) {
     let mut jx = Matrix::zeros(data.basis.nao(), data.basis.nao());
-    let mut kx = Matrix::zeros(data.basis.nao(), data.basis.nao());
+    let kx = Matrix::zeros(data.basis.nao(), data.basis.nao());
     for pair in &data.pairs {
         let Some((axis, sign)) = pair_coordinate(pair, coordinate) else {
             continue;
@@ -2558,11 +2782,10 @@ fn zindo_uhf_jk_derivative(data: &ZindoUhfResponseData, coordinate: usize) -> (M
                 let nu = ob + q;
                 jx[(mu, nu)] = value;
                 jx[(nu, mu)] = value;
-                kx[(mu, nu)] = value;
-                kx[(nu, mu)] = value;
             }
         }
     }
+    // kx stays zero: see zindo_jk_derivative.
     (jx, kx)
 }
 
@@ -2572,7 +2795,7 @@ fn zindo_uhf_jk_second_derivative(
     coordinate_y: usize,
 ) -> (Matrix, Matrix) {
     let mut jxy = Matrix::zeros(data.basis.nao(), data.basis.nao());
-    let mut kxy = Matrix::zeros(data.basis.nao(), data.basis.nao());
+    let kxy = Matrix::zeros(data.basis.nao(), data.basis.nao());
     for pair in &data.pairs {
         let (Some((axis_x, sign_x)), Some((axis_y, sign_y))) = (
             pair_coordinate(pair, coordinate_x),
@@ -2589,11 +2812,10 @@ fn zindo_uhf_jk_second_derivative(
                 let nu = ob + q;
                 jxy[(mu, nu)] = value;
                 jxy[(nu, mu)] = value;
-                kxy[(mu, nu)] = value;
-                kxy[(nu, mu)] = value;
             }
         }
     }
+    // kxy stays zero: see zindo_jk_derivative.
     (jxy, kxy)
 }
 
@@ -3165,7 +3387,7 @@ pub fn zindo_s_cis_gradients(
     let mut omega_derivatives = vec![vec![0.0; ncoord]; omega.len()];
     for (coord, response) in response_data.responses.iter().enumerate() {
         let mut jx = Matrix::zeros(basis.nao(), basis.nao());
-        let mut kx = Matrix::zeros(basis.nao(), basis.nao());
+        let kx = Matrix::zeros(basis.nao(), basis.nao());
         for pair in &response_data.pairs {
             let axis = coord % 3;
             let atom = coord / 3;
@@ -3188,8 +3410,7 @@ pub fn zindo_s_cis_gradients(
                     let nu = ob + q;
                     jx[(mu, nu)] = value;
                     jx[(nu, mu)] = value;
-                    kx[(mu, nu)] = value;
-                    kx[(nu, mu)] = value;
+                    // kx stays zero: see zindo_jk_derivative.
                 }
             }
         }

@@ -9,8 +9,18 @@
 //! integrals. The closed forms and the `rho1`/`rho2` secant solves follow
 //! MOPAC `calpar.F90`; the d-shell multipole extension (MNDO-d `ddpo`/`poij`)
 //! is added by the d-orbital milestone.
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/models/calpar.F90, src/integrals/mndod.F90 (`inid`, `ddpo`, `poij`, `aijm`), src/input/readmo.F90.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! folds a parameterisation's own physical constants into the exponents and
+//! prefactors, so MNDO/d reproduces upstream's pre-2019 constant set without
+//! a second coordinate system.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
-use crate::constants::{EV_TO_KCAL, HARTREE_TO_EV};
+use crate::constants::ModelConstants;
 use crate::data_tables::{self, CsvTable};
 use crate::error::{Result, XndoError};
 use crate::method::Method;
@@ -30,9 +40,21 @@ pub struct NddoElement {
     pub u_ss: f64,
     pub u_pp: f64,
     pub u_dd: f64,
+    /// Slater exponent for the s shell, **in the internal (CODATA) Bohr**.
+    ///
+    /// For a parameterisation fitted with a different Bohr radius this is the
+    /// published value times [`ModelConstants::length_scale`]; see that type for
+    /// why the scaling lives here rather than in the coordinates. Anything that
+    /// needs the published exponent -- a basis-set export, say -- must divide it
+    /// back out.
     pub zeta_s: f64,
     pub zeta_p: f64,
     pub zeta_d: f64,
+    /// Energy prefactor for this parameter set, in place of
+    /// [`crate::constants::HARTREE_TO_EV`]: see
+    /// [`ModelConstants::effective_hartree_ev`]. Carried per element so the
+    /// integral kernels, which only ever see elements, do not need threading.
+    pub hartree_ev: f64,
     pub beta_s: f64,
     pub beta_p: f64,
     pub beta_d: f64,
@@ -116,6 +138,9 @@ pub struct NddoParameters {
     pub elements: HashMap<u8, NddoElement>,
     /// Symmetric key `(max(zi,zj), min(zi,zj))`.
     pub pair: HashMap<(u8, u8), PairParams>,
+    /// The fundamental constants this parameterisation was fitted with. MOPAC
+    /// selects the historical set for `MNDOD` and CODATA for everything else.
+    pub constants: ModelConstants,
 }
 
 impl NddoParameters {
@@ -193,6 +218,16 @@ impl NddoParameters {
         pair_csv: &str,
     ) -> Result<Self> {
         let edata = data_tables::element_data();
+        // MOPAC evaluates MNDO/d with the pre-2019 constants (`readmo.F90:411`
+        // selects them for `MNDOD` as well as `OLDFPC`); everything else uses
+        // CODATA. The difference is folded into the exponents and the energy
+        // prefactor here, once, so no kernel has to know about it.
+        let constants = match method {
+            Method::MndoD => ModelConstants::HISTORICAL,
+            _ => ModelConstants::CODATA_2018,
+        };
+        let zeta_scale = constants.length_scale();
+        let hartree_ev = constants.effective_hartree_ev();
 
         // --- per-element parameters ---
         let t = CsvTable::parse(param_csv).ok_or_else(|| {
@@ -236,7 +271,10 @@ impl NddoParameters {
                 continue;
             }
             let ed = edata[z as usize];
-            let (zeta_p, zeta_d) = (get("zp"), get("zd"));
+            // Exponents are inverse lengths, so they carry the Bohr-radius
+            // change; see `NddoElement::zeta_s`.
+            let zeta = |n: &str| get(n) * zeta_scale;
+            let (zeta_p, zeta_d) = (zeta("zp"), zeta("zd"));
             let n_orb = if zeta_d > 0.0 {
                 9
             } else if zeta_p > 0.0 {
@@ -253,7 +291,7 @@ impl NddoParameters {
             }
 
             let n = ed.npq_s;
-            let zeta_s = get("zs");
+            let zeta_s = zeta("zs");
             let (mut g_ss, mut g_sp, mut g_pp, mut g_p2) =
                 (get("gss"), get("gsp"), get("gpp"), get("gp2"));
             // MOPAC calpar floors: zeta_p >= 0.3, hsp >= 1e-7, hpp >= 0.1.
@@ -264,16 +302,19 @@ impl NddoParameters {
             // SlaterCondon radial integrals (MOPAC `sp_two_electron`). This is
             // essential  using the fitted values makes the d shell far too
             // deep and the SCF collapses to an unphysical charge-transfer state.
-            let (zsn, zpn) = (get("zsn"), get("zpn"));
+            let (zsn, zpn) = (zeta("zsn"), zeta("zpn"));
             if !ed.main_group && zsn > 1.0e-4 && zpn > 1.0e-4 {
                 use crate::onecenter::slater_rsc;
                 let ns = ed.npq_s as i32;
                 let np = ed.npq_p as i32;
-                g_ss = slater_rsc(0, ns, zsn, ns, zsn, ns, zsn, ns, zsn);
-                g_sp = slater_rsc(0, ns, zsn, ns, zsn, np, zpn, np, zpn);
-                h_sp = (slater_rsc(1, ns, zsn, np, zpn, ns, zsn, np, zpn) / 3.0).max(1.0e-7);
-                let r033 = slater_rsc(0, np, zpn, np, zpn, np, zpn, np, zpn);
-                let r233 = slater_rsc(2, np, zpn, np, zpn, np, zpn, np, zpn);
+                let rsc = |k, na, ea, nb, eb, nc, ec, nd, ed| {
+                    slater_rsc(k, na, ea, nb, eb, nc, ec, nd, ed, hartree_ev)
+                };
+                g_ss = rsc(0, ns, zsn, ns, zsn, ns, zsn, ns, zsn);
+                g_sp = rsc(0, ns, zsn, ns, zsn, np, zpn, np, zpn);
+                h_sp = (rsc(1, ns, zsn, np, zpn, ns, zsn, np, zpn) / 3.0).max(1.0e-7);
+                let r033 = rsc(0, np, zpn, np, zpn, np, zpn, np, zpn);
+                let r233 = rsc(2, np, zpn, np, zpn, np, zpn, np, zpn);
                 g_pp = r033 + 0.16 * r233;
                 g_p2 = r033 - 0.08 * r233;
             }
@@ -286,14 +327,14 @@ impl NddoParameters {
                 let dd = dd_charge_sep(qn, zeta_s, zp);
                 let qq = qq_charge_sep(qn, zp);
                 let hpp = (0.5 * (g_pp - g_p2)).max(0.1);
-                let rho1 = additive_rho1(h_sp, dd);
-                let rho2 = additive_rho2(hpp, qq);
+                let rho1 = additive_rho1(h_sp, dd, &constants);
+                let rho2 = additive_rho2(hpp, qq, &constants);
                 (dd, qq, rho1, rho2)
             } else {
                 (0.0, 0.0, 0.0, 0.0)
             };
             let rho0 = if g_ss > 0.0 {
-                0.5 * HARTREE_TO_EV / g_ss
+                0.5 * hartree_ev / g_ss
             } else {
                 0.0
             };
@@ -328,6 +369,7 @@ impl NddoParameters {
                 zeta_s,
                 zeta_p,
                 zeta_d,
+                hartree_ev,
                 beta_s,
                 beta_p: get("betap"),
                 beta_d: get("betad"),
@@ -336,9 +378,9 @@ impl NddoParameters {
                 g_pp,
                 g_p2,
                 h_sp,
-                zsn: get("zsn"),
-                zpn: get("zpn"),
-                zdn: get("zdn"),
+                zsn,
+                zpn,
+                zdn: zeta("zdn"),
                 f0sd: get("f0sd"),
                 g2sd: get("g2sd"),
                 alpha: get("alp"),
@@ -351,7 +393,7 @@ impl NddoParameters {
                 occ_d: ed.occ_d,
                 main_group: ed.main_group,
                 ndelec: ed.ndelec,
-                eheat_ev: ed.eheat_kcal / EV_TO_KCAL,
+                eheat_ev: ed.eheat_kcal / constants.ev_to_kcal,
                 e_isol,
                 mass: ed.mass,
                 dd,
@@ -367,7 +409,7 @@ impl NddoParameters {
             // spd integrals are built first (they feed the d-multipole solver
             // and add the d-shell isolated-atom energy); the sp additive terms
             // then follow MOPAC `inid`'s main-group overwrite.
-            derive_multipoles(&mut elem);
+            derive_multipoles(&mut elem, &constants);
             elements.insert(z, elem);
         }
         if elements.is_empty() {
@@ -408,6 +450,7 @@ impl NddoParameters {
             method,
             elements,
             pair,
+            constants,
         })
     }
 }
@@ -485,9 +528,13 @@ pub fn qq_charge_sep(qn: f64, zp: f64) -> f64 {
 /// iterations, but for elements whose target integral was floored (`hpp  0.1` when `gpp < gp2`,
 /// e.g. every noble gas) the 5-iteration truncation differs from the converged root, and matching
 /// MOPAC's truncation is required for bit-agreement.
-pub fn additive_rho1(hsp_ev: f64, dd: f64) -> f64 {
+pub fn additive_rho1(hsp_ev: f64, dd: f64, constants: &ModelConstants) -> f64 {
+    // The secant is truncated at 5 steps, so it is not scale-invariant: run it
+    // in the units MOPAC ran it in and convert the root back afterwards.
+    let k = constants.length_scale();
+    let dd = dd * k;
     // MOPAC floors hsp to 1e-7 eV before the secant (calpar.F90:111).
-    let hsp = hsp_ev.max(1.0e-7) / HARTREE_TO_EV;
+    let hsp = hsp_ev.max(1.0e-7) / constants.hartree_to_ev;
     let g = |d: f64| 0.5 * d - 0.5 / (4.0 * dd * dd + 1.0 / (d * d)).sqrt();
     let gdd1 = (hsp / (dd * dd)).powf(1.0 / 3.0);
     let (mut d1, mut d2) = (gdd1, gdd1 + 0.04);
@@ -501,7 +548,7 @@ pub fn additive_rho1(hsp_ev: f64, dd: f64) -> f64 {
         d1 = d2;
         d2 = d3;
     }
-    0.5 / d2
+    0.5 / d2 / k
 }
 
 /// Additive term `rho2` reproducing the one-center quadrupole integral `H_pp` (Bohr).
@@ -509,8 +556,11 @@ pub fn additive_rho1(hsp_ev: f64, dd: f64) -> f64 {
 /// Solves `H_pp(au) = 14 q  12/(4 D22 + 1/q2) + 14/(8 D22 + 1/q2)` for `q`, returning
 /// `rho2 = 0.5/q`. **Exactly 5 secant iterations** (MOPAC `calpar.F90:172-185`, `jmax = 5`);
 /// see [`additive_rho1`].
-pub fn additive_rho2(hpp_ev: f64, qq: f64) -> f64 {
-    let hpp = hpp_ev / HARTREE_TO_EV;
+pub fn additive_rho2(hpp_ev: f64, qq: f64, constants: &ModelConstants) -> f64 {
+    // See `additive_rho1`: the truncated secant is run in the model's own Bohr.
+    let k = constants.length_scale();
+    let qq = qq * k;
+    let hpp = hpp_ev / constants.hartree_to_ev;
     let g = |q: f64| {
         0.25 * q - 0.5 / (4.0 * qq * qq + 1.0 / (q * q)).sqrt()
             + 0.25 / (8.0 * qq * qq + 1.0 / (q * q)).sqrt()
@@ -528,14 +578,14 @@ pub fn additive_rho2(hpp_ev: f64, qq: f64) -> f64 {
         q1 = q2;
         q2 = q3;
     }
-    0.5 / q2
+    0.5 / q2 / k
 }
 
 /// Fill the MNDO-d charge separations `ddp` and additive terms `po` on an
 /// element (MOPAC `aijm`/`ddpo`/`poij` + the main-group overwrite in `inid`).
 /// For a d element this also builds and attaches [`crate::onecenter::OneCenterSpd`]
 /// and folds its `eisol_d` into `e_isol`.
-fn derive_multipoles(elem: &mut NddoElement) {
+fn derive_multipoles(elem: &mut NddoElement, constants: &ModelConstants) {
     // One-center spd integrals (d elements): needed for the d additive-term
     // targets (`repd`) and the isolated-atom d-shell energy.
     if elem.has_d() {
@@ -545,33 +595,38 @@ fn derive_multipoles(elem: &mut NddoElement) {
         let aij = aijm(elem);
         // po(1)/ss monopole.
         if elem.g_ss > 0.1 {
-            elem.po[1] = poij(0, 1.0, elem.g_ss);
+            elem.po[1] = poij(0, 1.0, elem.g_ss, constants);
         }
         // sp dipole, pp quadrupole.
         let d_sp = aij[2] / 12.0_f64.sqrt();
         elem.ddp[2] = d_sp;
-        elem.po[2] = poij(1, d_sp, elem.h_sp);
+        elem.po[2] = poij(1, d_sp, elem.h_sp, constants);
         elem.po[7] = elem.po[1];
         let d_pp = (aij[3] * 0.1).sqrt();
         elem.ddp[3] = d_pp;
-        elem.po[3] = poij(2, d_pp, 0.5 * (elem.g_pp - elem.g_p2));
+        elem.po[3] = poij(2, d_pp, 0.5 * (elem.g_pp - elem.g_p2), constants);
         // d multipoles.
         let da = (1.0_f64 / 60.0).sqrt();
         let d_sd = (aij[4] * da).sqrt();
         elem.ddp[4] = d_sd;
-        elem.po[4] = poij(2, d_sd, oc.repd[19]);
+        elem.po[4] = poij(2, d_sd, oc.repd[19], constants);
         let d_pd = aij[5] / 20.0_f64.sqrt();
         elem.ddp[5] = d_pd;
-        elem.po[5] = poij(1, d_pd, oc.repd[23] - 1.8 * oc.repd[35]);
+        elem.po[5] = poij(1, d_pd, oc.repd[23] - 1.8 * oc.repd[35], constants);
         let fg_dd = 0.2 * (oc.repd[29] + 2.0 * oc.repd[30] + 2.0 * oc.repd[31]);
         elem.po[8] = if fg_dd > 1e-5 {
-            poij(0, 1.0, fg_dd)
+            poij(0, 1.0, fg_dd, constants)
         } else {
             1e5
         };
         let d_dd = (aij[6] / 14.0).sqrt();
         elem.ddp[6] = d_dd;
-        elem.po[6] = poij(2, d_dd, oc.repd[44] - (20.0 / 35.0) * oc.repd[52]);
+        elem.po[6] = poij(
+            2,
+            d_dd,
+            oc.repd[44] - (20.0 / 35.0) * oc.repd[52],
+            constants,
+        );
         elem.po[9] = elem.po[1];
         elem.onecenter = Some(oc);
     } else if elem.n_orb >= 4 {
@@ -591,16 +646,20 @@ fn derive_multipoles(elem: &mut NddoElement) {
         elem.po[9] = elem.rho0;
     }
     // Core additive-term override (MOPAC `inid`): `po(9) = pocord` when the
-    // element defines one (Sc, Fe, Ni, ...); otherwise `po(9) = po(1)`. `po(9)`
-    // enters BOTH the electroncore attraction and the corecore repulsion,
-    // where the two nearly cancel. Our two-center d path seeds the s/p
-    // electron-core block from the `rho0`-based s/p path, so `po(9)` currently
-    // reaches only the d-core terms; applying `poc` there alone breaks the
-    // cancellation and worsens the (already physical) Sc/Fe/Ni energies. Until
-    // the s/p electron-core seed is made `po(9)`-consistent, keep `po(9)=po(1)`
-    // (self-consistent with the core-core), leaving a ~1.5 kcal/mol residual on
-    // those three elements. `elem.poc` is retained for that future rework.
-    let _ = elem.poc;
+    // element defines one, otherwise `po(9) = po(1)`. `po(9)` is the core
+    // monopole that `repulsion.rs` puts in the Klopman denominator.
+    //
+    // For most elements carrying a `poc` this changes nothing: `poc` *is* the
+    // derived `po(1) = 13.6057 / g_ss` to five figures. Al, Si, P, S, Cl, Zn,
+    // Br, Cd, I and Hg all have `poc / po(1) = 1.000`. It is an independent
+    // number only for Na (`poc / po(1) = 0.517`) and Mg (`0.732`) in the MNDO/d
+    // table, and for the MNDO transition metals Sc, V, Cr, Fe, Mo, Pd, Ag, Pt.
+    //
+    // `pocord` is a length in the model's own Bohr, like every other `po`, so it
+    // takes the same scaling as the exponents do.
+    if elem.poc > 0.0 {
+        elem.po[9] = elem.poc / constants.length_scale();
+    }
 }
 
 /// MOPAC `aijm`/`aijl`: multipole normalization factors from the *valence*
@@ -643,12 +702,16 @@ fn aijl(z1: f64, z2: f64, n1: i32, n2: i32, l: i32) -> f64 {
 /// MOPAC `poij` (mndod.F90:165): additive Klopman term (Bohr) reproducing the
 /// one-center multipole integral `fg` (eV). Golden-section minimization for
 /// `l = 1, 2`; closed form for the monopole `l = 0`.
-fn poij(l: i32, d: f64, fg: f64) -> f64 {
+fn poij(l: i32, d: f64, fg: f64, constants: &ModelConstants) -> f64 {
+    // The golden-section search brackets [0.1, 5.0] and stops at an absolute
+    // 1e-8, so like the secants above it is run in the model's own Bohr.
+    let k = constants.length_scale();
     if l == 0 {
-        return 0.5 * HARTREE_TO_EV / fg;
+        return 0.5 * constants.hartree_to_ev / fg / k;
     }
-    let ev4 = HARTREE_TO_EV / 4.0;
-    let ev8 = HARTREE_TO_EV / 8.0;
+    let ev4 = constants.hartree_to_ev / 4.0;
+    let ev8 = constants.hartree_to_ev / 8.0;
+    let d = d * k;
     let dsq = d * d;
     let (mut a1, mut a2) = (0.1, 5.0);
     let (mut f1, mut f2) = (0.0, 0.0);
@@ -684,9 +747,9 @@ fn poij(l: i32, d: f64, fg: f64) -> f64 {
         }
     }
     if f1 >= f2 {
-        a2
+        a2 / k
     } else {
-        a1
+        a1 / k
     }
 }
 

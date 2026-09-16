@@ -1,4 +1,4 @@
-# Bundled semiempirical parameter datasets in xndo-rs 0.2.1
+# Bundled semiempirical parameter datasets in xndo-rs 0.3.0
 # `runtime-primary` means currently consumed from the bundled table by a native numerical engine; `runtime-mirror/audit` means the native implementation is active but the CSV is a provenance/audit mirror; `seed/cross-check` means reusable data is included but the corresponding historical engine/version is not yet fully wired.
 dataset_id,methods,elements,upstream,upstream_license,role
 openmopac_mndo,MNDO,OpenMOPAC-supported,OpenMOPAC-v23.2.5,Apache-2.0,runtime-primary
@@ -7,3 +7,4 @@ openmopac_zindo_s,ZINDO/S,38-element-table,OpenMOPAC-v23.2.5,Apache-2.0,runtime-
 mopac7_mindo3,MINDO/3,H-B-C-N-O-F-Si-P-S-Cl,MOPAC7,Public-Domain,runtime-mirror/audit
 molds_cndo2_indo,CNDO2|INDO,H-Li-C-N-O-S,MolDS-0.3.1,GPL-3.0-or-later,runtime-primary
 molds_zindo_s,ZINDO/S,H-C-N-O-S,MolDS-0.3.1,GPL-3.0-or-later,cross-check
+openmopac_element_data,all,all,OpenMOPAC-v23.2.5,Apache-2.0,runtime-primary

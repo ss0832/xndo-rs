@@ -16,6 +16,7 @@ use crate::mindo3::{
     analytic_ground_gradient as mindo3_gradient, analytic_ground_hessian as mindo3_hessian,
     run_mindo3, Mindo3Options, Mindo3Result,
 };
+use crate::orbitals::OrbitalEnergies;
 use crate::params::NddoParameters;
 use crate::scf::{run_nddo_with_parameters, NddoOptions, NddoResult};
 use crate::system::Molecule;
@@ -31,6 +32,56 @@ pub enum CalculationResult {
     Nddo(NddoResult),
     Mindo3(Mindo3Result),
     ZindoS(ZindoResult),
+}
+
+impl CalculationResult {
+    /// The converged reference determinant's orbital energies, whichever engine
+    /// produced them.
+    ///
+    /// The four result types spell the same quantity four ways
+    /// (`mo_energies` vs `mo_energies_ev`, beta present or absent); this is the
+    /// one accessor that does not care which engine ran.
+    pub fn orbitals(&self) -> OrbitalEnergies {
+        match self {
+            CalculationResult::CndoIndo(r) => r.orbitals(),
+            CalculationResult::Nddo(r) => r.orbitals(),
+            CalculationResult::Mindo3(r) => r.orbitals(),
+            CalculationResult::ZindoS(r) => r.orbitals(),
+        }
+    }
+
+    /// Ground-state total energy in eV, whichever engine produced it.
+    pub fn total_ev(&self) -> f64 {
+        match self {
+            CalculationResult::CndoIndo(r) => r.total_ev,
+            CalculationResult::Nddo(r) => r.total_ev,
+            CalculationResult::Mindo3(r) => r.total_ev,
+            CalculationResult::ZindoS(r) => r.total_ev,
+        }
+    }
+
+    /// Heat of formation in kcal/mol, for the methods parameterised to produce
+    /// one. `None` for CNDO/2, INDO and ZINDO/S, which have no atomic heat
+    /// terms, so their total energy is the comparable quantity.
+    pub fn heat_of_formation_kcal(&self) -> Option<f64> {
+        match self {
+            CalculationResult::Nddo(r) => Some(r.heat_of_formation_kcal),
+            CalculationResult::Mindo3(r) => Some(r.heat_of_formation_kcal),
+            CalculationResult::CndoIndo(_) | CalculationResult::ZindoS(_) => None,
+        }
+    }
+}
+
+/// Orbital energies and the frontier pair for any method with a native engine.
+///
+/// A single-point run under the hood; use it when the orbitals are what you
+/// want and the rest of the result is not.
+pub fn run_orbitals(
+    molecule: &Molecule,
+    method: Method,
+    options: &NddoOptions,
+) -> Result<OrbitalEnergies> {
+    Ok(run_method(molecule, method, options)?.orbitals())
 }
 
 /// Unified analytic ground-state nuclear gradient.
@@ -65,6 +116,9 @@ fn cndo_options(options: &NddoOptions) -> CndoIndoOptions {
         } else {
             options.damping
         },
+        accelerator: options.accelerator,
+        adiis_switch: options.adiis_switch,
+        scf_memory_mb: options.scf_memory_mb,
     }
 }
 
@@ -81,6 +135,9 @@ fn mindo_options(options: &NddoOptions) -> Mindo3Options {
         } else {
             options.damping
         },
+        accelerator: options.accelerator,
+        adiis_switch: options.adiis_switch,
+        scf_memory_mb: options.scf_memory_mb,
     }
 }
 
@@ -97,6 +154,9 @@ fn zindo_options(options: &NddoOptions) -> ZindoOptions {
         } else {
             options.damping
         },
+        accelerator: options.accelerator,
+        adiis_switch: options.adiis_switch,
+        scf_memory_mb: options.scf_memory_mb,
         ..ZindoOptions::default()
     }
 }

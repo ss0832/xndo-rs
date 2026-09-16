@@ -12,24 +12,57 @@
 //! MINDO/3 tables and the original Bingham, Dewar & Lo formulation; see
 //! `THIRD_PARTY_NOTICES.md` and `docs/parameter-provenance.md`.
 //! Energies are evaluated internally in eV and distances in Angstrom.
+//!
+//! PROVENANCE: derived from MOPAC7 1.15,
+//! public domain (no copyright asserted),
+//! see third_party/mopac7/NOTICE.
+//! UPSTREAM: fortran/block.f (MINDO/3 tables), analyt.f, delri.f, calpar.f, compfg.f.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! native Rust RHF/UHF with analytic derivatives; evaluated with the
+//! constants MOPAC7 itself uses.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 // AO, atom, and Cartesian indices are intentionally explicit in the fixed-size
 // matrix contractions below; iterator rewrites obscure the equations.
 #![allow(clippy::needless_range_loop)]
 
-use crate::constants::{BOHR_TO_ANGSTROM, EV_TO_KCAL};
+use crate::constants::{ModelConstants, BOHR_TO_ANGSTROM};
+
 use crate::dual::{Dual, Scalar};
 use crate::dual2::Dual2;
 use crate::error::{Result, XndoError};
 use crate::linalg::{symmetric_eigen, Matrix};
 use crate::math::Vec3;
+use crate::orbitals::OrbitalEnergies;
 use crate::scf::Reference;
+use crate::scf_accel::{
+    lowest_solution, open_shell_starts, sad_density_sp, uniform_valence_density, Accelerator,
+    ScfAccelerator,
+};
 use crate::system::Molecule;
 use crate::zdo_gradient::{
     atom_population, exchange_weight_rhf, exchange_weight_uhf, pair_energy, solve_rhf_responses,
     solve_uhf_responses, spin_densities,
 };
 
+/// MINDO/3 is evaluated with the constants MOPAC7 uses, which are the pre-2019
+/// set ([`ModelConstants::HISTORICAL`]).
+///
+/// MOPAC7 1.15 writes them as literals rather than tabulating them:
+/// `analyt.f:47` and `delri.f:22` have `A0 = 0.529167`; `calpar.f:129-165` and
+/// `delri.f:23` use `27.21` for the Hartree; `compfg.f:147` converts the heat of
+/// formation with `23.061`; and `analyt.f:147` uses `14.399` for the core-core
+/// Coulomb term, which is [`COULOMB_EV_ANG`] below.
+///
+/// Same reasoning as MNDO/d (`tests/data/ORACLE_NOTES.md` item 13): the
+/// parameters were fitted against these values, so they are part of the model
+/// rather than a rounding choice.
+const MOPAC7: ModelConstants = ModelConstants::HISTORICAL;
+
+/// `e^2 * a0` in eV*Angstrom, MOPAC7's `14.399` (`analyt.f:147`).
+///
+/// The pre-2019 value; CODATA gives 14.399645478456. It is spelled out here
+/// rather than taken from [`MOPAC7`] because MOPAC7 spells it out too.
 const COULOMB_EV_ANG: f64 = 14.399;
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +83,21 @@ pub struct Mindo3Element {
     pub gpp: f64,
     pub gp2: f64,
     pub hsp: f64,
+    /// The one-centre p-p' exchange integral `(pp'|pp')`, in eV.
+    ///
+    /// **Always exactly `(gpp - gp2) / 2`.** MOPAC7 does not store it: `fock1.f`
+    /// writes `GPP(NI) - GP2(NI)` and `0.5*(GPP(NI) - GP2(NI))` into the Fock
+    /// matrix directly, so the relation is structural rather than a coincidence
+    /// of the published tables. It is a field here only because the rest of the
+    /// one-centre set is, and `hp2_is_exactly_half_the_gpp_gp2_gap` holds it to
+    /// the relation.
+    ///
+    /// Until v0.3.0 four of the nine values were stored rounded to two decimals
+    /// -- N, Si, S and Cl, each 0.005 eV off -- which is a model change, not a
+    /// formatting one. It cost 2.2e-2 eV per chlorine atom against MOPAC7:
+    /// 8.6e-2 eV on CCl4, where every other molecule in the set agreed to about
+    /// 8e-4. Chlorine showed it worst because `p^5` has the most p-p' pairs for
+    /// the error to act on.
     pub hp2: f64,
     pub f03: f64,
     pub e_isol_ev: f64,
@@ -144,7 +192,7 @@ pub fn element(z: u8) -> Result<Mindo3Element> {
             gpp: 12.98,
             gp2: 11.59,
             hsp: 3.14,
-            hp2: 0.70,
+            hp2: 0.695,
             f03: 12.377,
             e_isol_ev: -187.51,
             e_heat_kcal: 113.0,
@@ -210,7 +258,7 @@ pub fn element(z: u8) -> Result<Mindo3Element> {
             gpp: 7.31,
             gp2: 6.54,
             hsp: 1.32,
-            hp2: 0.38,
+            hp2: 0.385,
             f03: 7.57,
             e_isol_ev: -90.98,
             e_heat_kcal: 106.0,
@@ -254,7 +302,7 @@ pub fn element(z: u8) -> Result<Mindo3Element> {
             gpp: 9.90,
             gp2: 8.83,
             hsp: 2.26,
-            hp2: 0.54,
+            hp2: 0.535,
             f03: 10.20,
             e_isol_ev: -229.15,
             e_heat_kcal: 65.65,
@@ -276,7 +324,7 @@ pub fn element(z: u8) -> Result<Mindo3Element> {
             gpp: 11.30,
             gp2: 9.97,
             hsp: 2.42,
-            hp2: 0.67,
+            hp2: 0.665,
             f03: 11.73,
             e_isol_ev: -345.93,
             e_heat_kcal: 28.95,
@@ -355,6 +403,13 @@ pub struct Mindo3Options {
     pub e_tol_ev: f64,
     pub p_tol: f64,
     pub damping: f64,
+    /// SCF convergence accelerator. Defaults to A-DIIS then CDIIS, matching the
+    /// NDDO driver; `damping` applies only when this is `ScfAccelerator::None`.
+    pub accelerator: ScfAccelerator,
+    /// Commutator norm below which A-DIIS hands over to CDIIS.
+    pub adiis_switch: f64,
+    /// Memory budget for the accelerator history, in MiB.
+    pub scf_memory_mb: usize,
 }
 impl Default for Mindo3Options {
     fn default() -> Self {
@@ -366,6 +421,9 @@ impl Default for Mindo3Options {
             e_tol_ev: 1.0e-8,
             p_tol: 1.0e-7,
             damping: 0.20,
+            accelerator: ScfAccelerator::AdiisCdiis,
+            adiis_switch: 0.1,
+            scf_memory_mb: 512,
         }
     }
 }
@@ -396,6 +454,33 @@ pub struct Mindo3Result {
     pub charges: Vec<f64>,
     pub iterations: usize,
     pub converged: bool,
+}
+
+impl Mindo3Result {
+    /// The orbital energies and the frontier quantities read off them.
+    pub fn orbitals(&self) -> OrbitalEnergies {
+        OrbitalEnergies::new(
+            self.mo_energies_ev.clone(),
+            self.n_alpha,
+            self.mo_energies_beta_ev.clone(),
+            self.n_beta,
+        )
+    }
+
+    /// Highest occupied spin orbital over both channels, in eV.
+    pub fn homo_ev(&self) -> Option<f64> {
+        self.orbitals().homo_ev()
+    }
+
+    /// Lowest unoccupied spin orbital over both channels, in eV.
+    pub fn lumo_ev(&self) -> Option<f64> {
+        self.orbitals().lumo_ev()
+    }
+
+    /// HOMO-LUMO gap in eV; `None` unless both frontier orbitals exist.
+    pub fn homo_lumo_gap_ev(&self) -> Option<f64> {
+        self.orbitals().gap_ev()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -450,15 +535,30 @@ fn overlap_block_g<S: Scalar>(ei: &Mindo3Element, ej: &Mindo3Element, d: [S; 3])
     } else {
         (ej, ei, [-dir[0], -dir[1], -dir[2]], true)
     };
+    // Exponents in MOPAC7's Bohr, not CODATA's.
+    //
+    // The overlap depends on `zeta * R` and nothing else, so an exponent
+    // tabulated against one Bohr radius and a distance measured in another is a
+    // 1.93e-5 relative error in every exponential in the integral. MOPAC7 uses
+    // a0 = 0.529167 A (`analyt.f:47`, `delri.f:22`), and these exponents were
+    // fitted with it, so `zeta * k` with `k = a0_CODATA / a0_MOPAC7` is the
+    // exact restatement of the same integral in the crate's internal Bohr --
+    // not an approximation to it.
+    //
+    // This is the same defect ORACLE_NOTES item 13 fixed for MNDO/d, and
+    // `params.rs` and `cndo_indo.rs` have applied it since; MINDO/3 was the
+    // engine it was never carried to. Worth a few times 1e-4 eV per atom pair,
+    // because the resonance energy it multiplies is several eV per bond.
+    let k = MOPAC7.length_scale();
     let (s111, s211, s121, s221, s222) = crate::overlap_numeric::slater_locals_numeric(
         ea.n_s,
         ea.n_p.max(ea.n_s),
-        ea.zeta_s,
-        ea.zeta_p.max(1e-12),
+        ea.zeta_s * k,
+        (ea.zeta_p * k).max(1e-12),
         eb.n_s,
         eb.n_p.max(eb.n_s),
-        eb.zeta_s,
-        eb.zeta_p.max(1e-12),
+        eb.zeta_s * k,
+        (eb.zeta_p * k).max(1e-12),
         r,
     );
     let di = crate::overlap::build_di_g::<S>([s111, s211, s121, s221, s222], direction);
@@ -715,16 +815,27 @@ fn electron_count(m: &Molecule, charge: f64) -> Result<usize> {
     }
     Ok(ne as usize)
 }
+/// Superposition of atomic densities.
+///
+/// This used to spread an atom's valence electrons uniformly over all of its
+/// AOs, which puts s and p on an equal footing they do not have. The shared
+/// `sad_density_sp` fills s first and spreads the remainder over p, which is
+/// the usual SAD and is what every engine now starts from.
 fn initial_density(m: &Molecule, b: &Basis) -> Result<Matrix> {
-    let mut p = Matrix::zeros(b.nao(), b.nao());
-    for ia in 0..m.atoms.len() {
-        let e = element(m.atoms[ia].z)?;
-        let q = e.core_charge / e.n_orb as f64;
-        for i in 0..e.n_orb {
-            p[(b.offsets[ia] + i, b.offsets[ia] + i)] = q;
-        }
-    }
-    Ok(p)
+    Ok(sad_density_sp(b.nao(), &valence_shells(m, b)?))
+}
+
+/// `(first AO index, AO count, core charge)` per atom, the shape the shared
+/// guess builders take.
+fn valence_shells(m: &Molecule, b: &Basis) -> Result<Vec<(usize, usize, f64)>> {
+    m.atoms
+        .iter()
+        .enumerate()
+        .map(|(ia, a)| -> Result<(usize, usize, f64)> {
+            let e = element(a.z)?;
+            Ok((b.offsets[ia], e.n_orb, e.core_charge))
+        })
+        .collect()
 }
 
 fn electron_partition(ne: usize, multiplicity: usize) -> Result<(usize, usize)> {
@@ -781,7 +892,7 @@ fn reference_kcal(m: &Molecule) -> Result<f64> {
         hf += e.e_heat_kcal;
         eisol += e.e_isol_ev;
     }
-    Ok(hf - eisol * EV_TO_KCAL)
+    Ok(hf - eisol * MOPAC7.ev_to_kcal)
 }
 fn add(a: &Matrix, b: &Matrix) -> Matrix {
     let mut c = Matrix::zeros(a.rows, a.cols);
@@ -833,11 +944,22 @@ pub fn run_mindo3(m: &Molecule, opt: &Mindo3Options) -> Result<Mindo3Result> {
     if reference == Reference::Rhf {
         let nocc = n_alpha;
         let mut p = initial_density(m, &b)?;
+        let mut accel = Accelerator::new(
+            b.nao(),
+            opt.accelerator,
+            opt.adiis_switch,
+            opt.scf_memory_mb,
+        );
         for it in 1..=opt.max_scf {
             let f = build_fock_rhf(m, &b, &h, &p)?;
-            let (_eps, c) = symmetric_eigen(&f)?;
+            let f_use = accel.step(f.clone(), &p);
+            let (_eps, c) = symmetric_eigen(&f_use)?;
             let raw = c.leading_columns_gram(nocc, 2.0);
-            let pn = damp_density(&raw, &p, damping);
+            let pn = if accel.is_active() {
+                raw
+            } else {
+                damp_density(&raw, &p, damping)
+            };
             let eel = 0.5 * pn.frobenius_dot(&add(&h, &f));
             let perr = pn.rms_difference(&p);
             let eerr = (eel - last_e).abs();
@@ -866,7 +988,7 @@ pub fn run_mindo3(m: &Molecule, opt: &Mindo3Options) -> Result<Mindo3Result> {
                     electronic_ev: elec,
                     core_ev: core,
                     total_ev: total,
-                    heat_of_formation_kcal: total * EV_TO_KCAL + reference_kcal(m)?,
+                    heat_of_formation_kcal: total * MOPAC7.ev_to_kcal + reference_kcal(m)?,
                     charges: charges(m, &b, &p)?,
                     iterations: it,
                     converged: true,
@@ -874,63 +996,100 @@ pub fn run_mindo3(m: &Molecule, opt: &Mindo3Options) -> Result<Mindo3Result> {
             }
         }
     } else {
-        // Core-Hamiltonian guess gives separate one-electron occupied spaces.
-        let (_, c0) = symmetric_eigen(&h)?;
-        let mut pa = c0.leading_columns_gram(n_alpha, 1.0);
-        let mut pb = c0.leading_columns_gram(n_beta, 1.0);
-        for it in 1..=opt.max_scf {
-            let (fa, fb) = build_fock_uhf(m, &b, &h, &pa, &pb)?;
-            let (_ea, ca) = symmetric_eigen(&fa)?;
-            let (_eb, cb) = symmetric_eigen(&fb)?;
-            let pa_raw = ca.leading_columns_gram(n_alpha, 1.0);
-            let pb_raw = cb.leading_columns_gram(n_beta, 1.0);
-            let pa_next = damp_density(&pa_raw, &pa, damping);
-            let pb_next = damp_density(&pb_raw, &pb, damping);
-            let pt_next = add(&pa_next, &pb_next);
-            let eel = 0.5
-                * (pt_next.frobenius_dot(&h)
-                    + pa_next.frobenius_dot(&fa)
-                    + pb_next.frobenius_dot(&fb));
-            let perr = pa_next.rms_difference(&pa).max(pb_next.rms_difference(&pb));
-            let eerr = (eel - last_e).abs();
-            pa = pa_next;
-            pb = pb_next;
-            last_e = eel;
-            last_err = perr;
-            if perr < opt.p_tol && eerr < opt.e_tol_ev {
-                let (fa2, fb2) = build_fock_uhf(m, &b, &h, &pa, &pb)?;
-                let (ea2, ca2) = symmetric_eigen(&fa2)?;
-                let (eb2, cb2) = symmetric_eigen(&fb2)?;
-                pa = ca2.leading_columns_gram(n_alpha, 1.0);
-                pb = cb2.leading_columns_gram(n_beta, 1.0);
-                let pt = add(&pa, &pb);
-                let (fa3, fb3) = build_fock_uhf(m, &b, &h, &pa, &pb)?;
-                let elec =
-                    0.5 * (pt.frobenius_dot(&h) + pa.frobenius_dot(&fa3) + pb.frobenius_dot(&fb3));
-                let total = elec + core;
-                return Ok(Mindo3Result {
-                    density: pt.clone(),
-                    fock: fa3,
-                    fock_beta: Some(fb3),
-                    mo_coeff: ca2,
-                    mo_coeff_beta: Some(cb2),
-                    mo_energies_ev: ea2,
-                    mo_energies_beta_ev: Some(eb2),
-                    n_occ: n_alpha,
-                    n_alpha,
-                    n_beta,
-                    spin_density: Some(sub(&pa, &pb)),
-                    unrestricted: true,
-                    electronic_ev: elec,
-                    core_ev: core,
-                    total_ev: total,
-                    heat_of_formation_kcal: total * EV_TO_KCAL + reference_kcal(m)?,
-                    charges: charges(m, &b, &pt)?,
-                    iterations: it,
-                    converged: true,
-                });
+        // One SCF per candidate start, keeping the lowest: which orbital the
+        // unpaired electron lands in is settled by the first Fock matrix, and a
+        // guess can get that ordering wrong in a way no amount of converging
+        // undoes. See `scf_accel::open_shell_starts`.
+        let solve = |start: (Matrix, Matrix)| -> Result<Mindo3Result> {
+            let (mut pa, mut pb) = start;
+            let mut last_e = f64::INFINITY;
+            let mut last_err = f64::INFINITY;
+            // One accelerator for both spin channels. They are *not* independent --
+            // each Fock matrix is built from the total density, so it depends on the
+            // other channel's -- and the textbook UHF-DIIS error vector is the
+            // stacked pair extrapolated with a single set of coefficients.
+            let mut accel = Accelerator::new_uhf(
+                b.nao(),
+                opt.accelerator,
+                opt.adiis_switch,
+                opt.scf_memory_mb,
+            );
+            for it in 1..=opt.max_scf {
+                let (fa, fb) = build_fock_uhf(m, &b, &h, &pa, &pb)?;
+                // The accelerator consumes the Fock matrix it extrapolates, but the
+                // energy below has to be evaluated with the *unextrapolated* one --
+                // the extrapolated matrix is a fit, not `F[P]`, and pairing it with
+                // a density would report an energy the model never produced.
+                let (fa_use, fb_use) = accel.step_uhf(fa.clone(), fb.clone(), &pa, &pb);
+                let (_ea, ca) = symmetric_eigen(&fa_use)?;
+                let (_eb, cb) = symmetric_eigen(&fb_use)?;
+                let pa_raw = ca.leading_columns_gram(n_alpha, 1.0);
+                let pb_raw = cb.leading_columns_gram(n_beta, 1.0);
+                let (pa_next, pb_next) = if accel.is_active() {
+                    (pa_raw, pb_raw)
+                } else {
+                    (
+                        damp_density(&pa_raw, &pa, damping),
+                        damp_density(&pb_raw, &pb, damping),
+                    )
+                };
+                let pt_next = add(&pa_next, &pb_next);
+                let eel = 0.5
+                    * (pt_next.frobenius_dot(&h)
+                        + pa_next.frobenius_dot(&fa)
+                        + pb_next.frobenius_dot(&fb));
+                let perr = pa_next.rms_difference(&pa).max(pb_next.rms_difference(&pb));
+                let eerr = (eel - last_e).abs();
+                pa = pa_next;
+                pb = pb_next;
+                last_e = eel;
+                last_err = perr;
+                if perr < opt.p_tol && eerr < opt.e_tol_ev {
+                    let (fa2, fb2) = build_fock_uhf(m, &b, &h, &pa, &pb)?;
+                    let (ea2, ca2) = symmetric_eigen(&fa2)?;
+                    let (eb2, cb2) = symmetric_eigen(&fb2)?;
+                    pa = ca2.leading_columns_gram(n_alpha, 1.0);
+                    pb = cb2.leading_columns_gram(n_beta, 1.0);
+                    let pt = add(&pa, &pb);
+                    let (fa3, fb3) = build_fock_uhf(m, &b, &h, &pa, &pb)?;
+                    let elec = 0.5
+                        * (pt.frobenius_dot(&h) + pa.frobenius_dot(&fa3) + pb.frobenius_dot(&fb3));
+                    let total = elec + core;
+                    return Ok(Mindo3Result {
+                        density: pt.clone(),
+                        fock: fa3,
+                        fock_beta: Some(fb3),
+                        mo_coeff: ca2,
+                        mo_coeff_beta: Some(cb2),
+                        mo_energies_ev: ea2,
+                        mo_energies_beta_ev: Some(eb2),
+                        n_occ: n_alpha,
+                        n_alpha,
+                        n_beta,
+                        spin_density: Some(sub(&pa, &pb)),
+                        unrestricted: true,
+                        electronic_ev: elec,
+                        core_ev: core,
+                        total_ev: total,
+                        heat_of_formation_kcal: total * MOPAC7.ev_to_kcal + reference_kcal(m)?,
+                        charges: charges(m, &b, &pt)?,
+                        iterations: it,
+                        converged: true,
+                    });
+                }
             }
-        }
+            Err(XndoError::ScfNotConverged {
+                iterations: opt.max_scf,
+                error: last_err,
+            })
+        };
+        let sad = initial_density(m, &b)?;
+        let uniform = uniform_valence_density(b.nao(), &valence_shells(m, &b)?);
+        return lowest_solution(
+            open_shell_starts(&sad, &uniform, n_alpha, n_beta),
+            solve,
+            |r| r.total_ev,
+        );
     }
     Err(XndoError::ScfNotConverged {
         iterations: opt.max_scf,
@@ -1294,6 +1453,34 @@ pub fn analytic_ground_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hp2_is_exactly_half_the_gpp_gp2_gap() {
+        // MOPAC7 never stores this integral: `fock1.f` writes `GPP - GP2` and
+        // `0.5*(GPP - GP2)` straight into the Fock matrix, so the relation is
+        // part of the model and not a property of how the tables were printed.
+        // Four values used to be stored rounded to two decimals, which moved
+        // CCl4 by 8.6e-2 eV against MOPAC7.
+        //
+        // 1e-12 rather than exact equality. Not a hedge: none of these decimal
+        // literals is representable in binary, so `8.86 - 7.86` is
+        // 0.9999999999999991 and the difference from the literal `0.5` is real
+        // arithmetic, about 4e-17. The bound sits five orders below the
+        // smallest thing that could be a transcription error (a unit in the
+        // third decimal, 1e-3) and four above the rounding, so it separates the
+        // two without admitting anything in between.
+        for z in [5, 6, 7, 8, 9, 14, 15, 16, 17] {
+            let e = element(z).unwrap();
+            let derived = 0.5 * (e.gpp - e.gp2);
+            assert!(
+                (e.hp2 - derived).abs() < 1.0e-12,
+                "Z={z}: hp2 {} is not (gpp {} - gp2 {})/2 = {derived}",
+                e.hp2,
+                e.gpp,
+                e.gp2,
+            );
+        }
+    }
+
     #[test]
     fn canonical_elements_exist() {
         for z in [1, 5, 6, 7, 8, 9, 14, 15, 16, 17] {

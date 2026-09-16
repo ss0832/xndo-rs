@@ -8,6 +8,14 @@
 //! (GPL-3.0-or-later).
 //! Every legacy CSV carries its own provenance header; see
 //! `docs/parameter-provenance.md` and `THIRD_PARTY_NOTICES.md`.
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/models/parameters_C.F90 and the per-method parameter modules.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! extracted the tables to CSV and embedded them.
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 /// MNDO per-element parameters from OpenMOPAC v23.2.5.
 pub const MNDO_PARAM_CSV: &str = include_str!("data/mndo_parameters.csv");

@@ -6,6 +6,16 @@
 //! `s, px, py, pz`); heavier shells fall back to the numerical quadrature
 //! ([`crate::overlap_numeric`]). The full spd 9x9 diatomic overlap for d
 //! elements is [`diatom_overlap_spd`] (local sigma/pi/delta overlaps plus p/d rotation).
+//!
+//! PROVENANCE: derived from MOPAC (Molecular Orbital PACkage) v23.2.5,
+//! Copyright 2021 Virginia Polytechnic Institute and State University,
+//! licensed under the Apache License, Version 2.0.
+//! UPSTREAM: src/integrals/diat.F90 and src/integrals/set.F90.
+//! MODIFIED for xndo-rs v0.3.0 on 2026-09-14:
+//! the radial integrals are evaluated by Gauss-Legendre quadrature rather
+//! than upstream's truncated `bintgs` power series, which is why this is
+//! smooth where upstream steps (ORACLE_NOTES item 21).
+//! Retained notices: NOTICE; per-file record: THIRD_PARTY_NOTICES.md.
 
 use crate::dual::{Dual, Scalar};
 use crate::dual2::Dual2;

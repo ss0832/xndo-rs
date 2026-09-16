@@ -14,6 +14,22 @@ interfaces for selected NDO-family semiempirical methods.
 | MINDO/3 | RHF/UHF | analytic gradient, Hessian, optimization, frequencies | no | MOPAC7 |
 | ZINDO/S | RHF/UHF | analytic ground optimization/derivatives and state gradients/Hessians | RHF singlet/triplet CIS; UHF spin-orbital UCIS; UV-vis properties | OpenMOPAC 23.2.5 |
 
+Every method also reports orbital energies, occupations and the HOMO/LUMO pair,
+and can write a Molden wavefunction file. Molden coefficients are
+back-transformed with `S^(-1/2)`: the engines assume an orthonormal AO basis and
+a Molden file does not describe one, so the raw coefficients would give a
+reader a density that does not integrate to the electron count.
+
+Each method is checked against the program its own parameters came from --
+OpenMOPAC 23.2.5, MolDS 0.3.1, MOPAC7 1.15 -- over 2415 independent scalar
+comparisons with no known disagreements. `VALIDATION_STATUS.md` has the table
+and `tests/data/ORACLE_NOTES.md` the detail.
+
+**No correlated method is implemented**: no MP2, no coupled cluster, no CI, no
+multireference. `docs/scope.md` lists what is out, and
+`docs/v0.3.0-delivery.md` records what this release delivers against what was
+planned, together with its known problems.
+
 CNDO/1, INDO/1, INDO/2, ZINDO/1, ZINDO/2, MINDO/1, MINDO/2,
 SINDO1, and MSINDO are registered but deliberately fail at execution because
 no complete, compatible, provenance-audited parameter and Hamiltonian set is
@@ -40,12 +56,42 @@ Build local PyPI artifacts with:
 
 ```text
 cargo check --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 maturin build --release --features python
 maturin sdist
-twine check dist/*
+twine check target/wheels/*
+pip install --force-reinstall --no-deps target/wheels/*.whl
 python -m pytest tests/test_python.py tests/test_python_api.py
 ```
+
+Install the wheel before running the Python tests. They open with
+`pytest.importorskip("xndo_rs")`, so against a source tree with nothing
+installed they all skip and report success without having run.
+
+A release build records the directories it was built from -- the project, the
+cargo registry and the rustup toolchains -- inside the binary, which for a
+published artifact means the maintainer's home directory. `[profile.release]`
+sets `strip = "symbols"`; supply the rest at build time. `CARGO_HOME` and
+`RUSTUP_HOME` are the canonical variables for the other two; set them if your
+environment has not already.
+
+```text
+RUSTFLAGS="--remap-path-prefix=$PWD=. --remap-path-prefix=$CARGO_HOME=/cargo --remap-path-prefix=$RUSTUP_HOME=/rustup" maturin build --release --features python
+```
+
+Then check, rather than assume:
+
+```text
+python tools/privacy_scan.py --artifacts target/wheels/*.whl target/wheels/*.tar.gz target/release/xndo_rs_cli*
+```
+
+The scanner reads inside archives and binaries. It permits an e-mail address
+only where the same address appears in this tree's licence and notice documents,
+because those are the attributions Apache-2.0 4(c) and the GPL require to be
+carried and `src/licenses.rs` embeds them in every binary. One known finding it
+will report is maturin's generated `.dist-info/sboms/*.cyclonedx.json`, which
+records absolute source paths; remove it, or do not publish that wheel.
 
 The release profile uses fat LTO and one code-generation unit. Embedded tables
 are parsed once per process. The ZDO Hessian engines solve all Cartesian CPHF

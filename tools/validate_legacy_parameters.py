@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Validate the provenance-audited parameter tables retained in xndo-rs 0.2.3."""
+"""Validate the provenance-audited parameter tables retained in xndo-rs.
+
+The version is read from Cargo.toml rather than written here. A hardcoded
+one goes stale at the first release and then quietly contradicts the tree.
+"""
 from __future__ import annotations
 
 import csv
@@ -9,15 +13,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "src" / "data"
 
+
+def crate_version() -> str:
+    """The version in Cargo.toml, which is the single source of truth."""
+    for line in (ROOT / "Cargo.toml").read_text(encoding="utf-8").splitlines():
+        if line.startswith("version"):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise SystemExit("Cargo.toml has no version")
+
 EXPECTED_ROWS = {
     "molds_cndo2_indo_parameters.csv": 6,
     "molds_zindo_s_parameters.csv": 5,
     "mindo3_parameters.csv": 10,
     "mindo3_pair_parameters.csv": 40,
-    "legacy_parameter_catalog.csv": 6,
+    "legacy_parameter_catalog.csv": 7,
 }
 
 MANIFEST_FILES = [
+    "element_data.csv",
     "mndo_parameters.csv",
     "mndo_pair_parameters.csv",
     "mndod_parameters.csv",
